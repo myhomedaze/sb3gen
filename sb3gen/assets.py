@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 import hashlib
 import json
+import struct
 from xml.sax.saxutils import escape as _xml_escape
 
 from .patcher import AssetDecision, AssetSourceType
@@ -147,6 +148,49 @@ def _generate_svg_from_prompt(prompt: str) -> bytes:
         '</svg>'
     )
     return svg.encode("utf-8")
+
+
+def _generate_blank_backdrop_svg() -> bytes:
+    """Stageの自動生成時のデフォルト背景（白地、480x360）。"""
+    svg = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<svg xmlns="http://www.w3.org/2000/svg" width="480" height="360" viewBox="0 0 480 360">\n'
+        '<rect x="0" y="0" width="480" height="360" fill="#ffffff"/>\n'
+        '</svg>'
+    )
+    return svg.encode("utf-8")
+
+
+def register_default_backdrop(registry: Optional["AssetRegistry"] = None) -> CostumeSpec:
+    """白地の背景をレジストリに登録し、対応するCostumeSpecを返す。
+
+    compile_projectがStageを自動生成する際に、レジストリに登録されていない
+    固定assetIdを使い回していた問題（writer側で意図しないプレースホルダーに
+    フォールバックしてしまう）を回避するためのヘルパー。
+    """
+    reg = registry if registry is not None else DEFAULT_REGISTRY
+    content = _generate_blank_backdrop_svg()
+    asset_id = _compute_md5(content)
+    if not reg.has(asset_id):
+        reg.register(AssetRecord(asset_id=asset_id, data_format="svg", name="backdrop1", content=content))
+    return CostumeSpec(name="backdrop1", data_format="svg", asset_id=asset_id)
+
+
+def _generate_silent_wav(duration_seconds: float = 0.2, sample_rate: int = 44100) -> bytes:
+    """サイレンスのWAVを生成する（サウンドアセット欠落時のフォールバックに使う）。"""
+    num_samples = max(1, int(duration_seconds * sample_rate))
+    num_channels = 1
+    bits_per_sample = 16
+    byte_rate = sample_rate * num_channels * bits_per_sample // 8
+    block_align = num_channels * bits_per_sample // 8
+    data = b"\x00\x00" * num_samples
+    data_size = len(data)
+    header = (
+        b"RIFF" + struct.pack("<I", 36 + data_size) + b"WAVEfmt "
+        + struct.pack("<IHHIIHH", 16, 1, num_channels, sample_rate, byte_rate, block_align, bits_per_sample)
+        + b"data" + struct.pack("<I", data_size)
+    )
+    return header + data
 
 
 def _generate_placeholder_svg(name: str = "placeholder") -> bytes:

@@ -11,7 +11,13 @@ from typing import Optional, Union
 
 from .assets import AssetMaterializer, AssetRegistry, DEFAULT_REGISTRY
 from .compiler import compile_project
-from .patcher import LLMCallable, MaterializeAssetCallable, PatchStatus, apply_patch
+from .patcher import (
+    LLMCallable,
+    MaterializeAssetCallable,
+    PatchStatus,
+    PendingClarification,
+    apply_patch,
+)
 from .schema import ProjectSpec
 from .writer import write_sb3
 
@@ -26,6 +32,8 @@ def generate_sb3(
 ) -> ProjectSpec:
     """
     指示文から .sb3 を生成する。
+    指示が曖昧な場合（NEEDS_CLARIFICATION）は、ターミナルから追加の回答を
+    受け取りながら最大MAX_CLARIFICATION_TURNS回まで聞き返しを繰り返す。
     """
     project = project or ProjectSpec()
 
@@ -37,16 +45,29 @@ def generate_sb3(
 
     registry = registry or DEFAULT_REGISTRY
 
-    result = apply_patch(
-        project,
-        instruction,
-        llm_call,
-        materialize_asset=materializer,
-    )
+    pending: Optional[PendingClarification] = None
+    current_instruction = instruction
 
-    if result.status != PatchStatus.SUCCESS:
+    while True:
+        result = apply_patch(
+            project,
+            current_instruction,
+            llm_call,
+            materialize_asset=materializer,
+            pending=pending,
+        )
+
+        if result.status == PatchStatus.SUCCESS:
+            break
+
+        if result.status == PatchStatus.NEEDS_CLARIFICATION:
+            print(result.message)
+            current_instruction = input("> ")
+            pending = result.pending_clarification
+            continue
+
         raise RuntimeError(f"パッチ適用に失敗しました: {result.message or result.status}")
 
-    compiled = compile_project(result.project)
+    compiled = compile_project(result.project, registry=registry)
     write_sb3(compiled, output_path, registry=registry)
     return result.project

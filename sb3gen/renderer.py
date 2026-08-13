@@ -1,63 +1,51 @@
 """
 sb3gen/renderer.py
-SpriteSpec およびスクリプト・ブロック構造をインデント付き疑似コードに変換するモジュール。
+ProjectSpec (ツリー構造) から疑似コードへの逆変換（レンダリング）層。
 """
 
 from __future__ import annotations
-from typing import Any
-from .schema import SpriteSpec, ScriptSpec, BlockSpec
 
-
-def render_value(val: Any) -> str:
-    if isinstance(val, dict):
-        if "opcode" in val:
-            return f"[{val.get('opcode')}(...)]"
-        return str(val)
-    return str(val)
-
-
-def render_block(block: BlockSpec, indent: int = 0) -> str:
-    pad = "  " * indent
-    args_parts = []
-    if block.fields:
-        for k, v in block.fields.items():
-            args_parts.append(f"{k}={render_value(v)}")
-    
-    args_str = f"({', '.join(args_parts)})" if args_parts else "()"
-    header = f"{pad}{block.opcode}{args_str}"
-
-    if block.substacks:
-        body_lines = []
-        for sub_script in block.substacks:
-            sub_rendered = render_script_as_pseudocode(sub_script, indent + 1)
-            if sub_rendered:
-                body_lines.append(sub_rendered)
-        if body_lines:
-            return f"{header}\n{'\n'.join(body_lines)}\n{pad}end"
-
-    return header
-
-
-def render_script_as_pseudocode(script: ScriptSpec, indent: int = 0) -> str:
-    if not script.blocks:
-        return ""
-    return "\n".join(render_block(b, indent) for b in script.blocks)
+from typing import List
+from .schema import SpriteSpec, BlockSpec, ScriptSpec
 
 
 def render_sprite_pseudocode(sprite: SpriteSpec) -> str:
-    costume_names = [c.name for c in sprite.costumes]
-    meta = (
-        f"Sprite Name: {sprite.name}\n"
-        f"Is Stage: {sprite.is_stage}\n"
-        f"Initial Position: x={sprite.x}, y={sprite.y}\n"
-        f"Costumes: {costume_names}\n"
-    )
+    header = f"sprite {sprite.name} (x: {sprite.x}, y: {sprite.y}, size: {sprite.size}, visible: {sprite.visible}):"
     
-    rendered_scripts = []
-    for i, script in enumerate(sprite.scripts):
-        rendered = render_script_as_pseudocode(script, indent=0)
-        if rendered:
-            rendered_scripts.append(f"# Script {i+1}\n{rendered}")
+    body_lines: List[str] = []
+    for costume in sprite.costumes:
+        body_lines.append(f"  costume {costume.name} ({costume.bitmap_resolution or 1})")
+    
+    for script in sprite.scripts:
+        body_lines.extend(_render_script(script, indent=2))
+            
+    joined = "\n".join(body_lines)
+    pad = ""
+    return f"{header}\n{joined}\n{pad}end"
 
-    scripts_text = "\n---\n".join(rendered_scripts) if rendered_scripts else "(No scripts)"
-    return f"{meta}\nScripts:\n{scripts_text}"
+
+def _render_script(script: ScriptSpec, indent: int) -> List[str]:
+    lines: List[str] = []
+    for block in script.blocks:
+        lines.extend(_render_block(block, indent))
+    return lines
+
+
+def _render_block(block: BlockSpec, indent: int) -> List[str]:
+    pad = " " * indent
+    line = f"{pad}{block.opcode}"
+    
+    if block.fields:
+        field_parts = [f"{k}={v}" for k, v in block.fields.items()]
+        line += f" fields({', '.join(field_parts)})"
+        
+    if block.inputs:
+        input_parts = [f"{k}={v}" for k, v in block.inputs.items()]
+        line += f" inputs({', '.join(input_parts)})"
+        
+    lines = [line]
+    for substack in block.substacks:
+        for sub_block in substack:
+            lines.extend(_render_block(sub_block, indent + 2))
+            
+    return lines

@@ -1,0 +1,5 @@
+# バイナリまたは改行コードを固定したいファイル群
+*.svg binary
+*.png binary
+*.wav binary
+*.sb3 binary

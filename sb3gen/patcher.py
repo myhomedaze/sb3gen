@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Type, TypeVar
+from typing import Callable, List, Optional, Type, TypeVar
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -21,6 +21,7 @@ from .schema import (
     CostumeSpec,
 )
 from .renderer import render_sprite_pseudocode
+from .linter import reconcile_globals
 
 LLMCallable = Callable[[str, str], str]
 
@@ -52,11 +53,19 @@ def _generate_with_retry(
     llm_call: LLMCallable,
     max_retries: int = MAX_GENERATION_RETRIES,
 ) -> _ModelT:
+    schema_json = json.dumps(model_cls.model_json_schema(), ensure_ascii=False, indent=2)
+    enhanced_system_prompt = (
+        f"{system_prompt}\n\n"
+        "【出力形式の厳守】\n"
+        "必ず以下のJSONスキーマに完全に準拠したJSONオブジェクトのみを出力してください（Markdownのコードブロックを含め、余分なテキストや解説は一切含めないこと）。\n"
+        f"{schema_json}"
+    )
+
     user_prompt = initial_user_prompt
     last_error: Optional[str] = None
 
     for attempt in range(1, max_retries + 1):
-        raw = llm_call(system_prompt, user_prompt)
+        raw = llm_call(enhanced_system_prompt, user_prompt)
         cleaned = _strip_code_fence(raw)
 
         try:
@@ -93,6 +102,36 @@ class EditTarget(BaseModel):
     raw_instruction: str = Field(default="")
 
 
+class ClarificationTurn(BaseModel):
+    question: str
+    user_answer: str
+
+
+class PendingClarification(BaseModel):
+    original_instruction: str
+    turns: List[ClarificationTurn] = Field(default_factory=list)
+    current_question: Optional[str] = Field(default=None)
+
+    @property
+    def turn_count(self) -> int:
+        return len(self.turns)
+
+    def history_as_text(self) -> str:
+        if not self.turns:
+            return f"最初の要望: {self.original_instruction}"
+        lines = [f"最初の要望: {self.original_instruction}"]
+        for i, t in enumerate(self.turns, start=1):
+            lines.append(f"  Q{i}: {t.question}")
+            lines.append(f"  A{i}: {t.user_answer}")
+        return "\n".join(lines)
+
+    def combined_instruction(self) -> str:
+        parts = [self.original_instruction]
+        for t in self.turns:
+            parts.append(f"（補足質問「{t.question}」への回答: {t.user_answer}）")
+        return " ".join(parts)
+
+
 _CLASSIFY_SYSTEM_PROMPT = """あなたはScratch 3.0プロジェクト編集システムの指示分類器です。
 ユーザーの自然言語指示を解析し、次のいずれか一つに分類してください:
 - modify_sprite: 既存の特定スプライトを変更する
@@ -100,7 +139,6 @@ _CLASSIFY_SYSTEM_PROMPT = """あなたはScratch 3.0プロジェクト編集シ�
 - remove_sprite: 既存のスプライトを削除する
 - modify_globals: グローバル変数・リスト・ブロードキャストの変更
 - clarification_needed: 対象や意図が曖昧で確定できない
-JSON形式のみで出力すること。
 """
 
 
@@ -126,35 +164,6 @@ def classify_edit_target(
     return target
 
 
-class ClarificationTurn(BaseModel):
-    question: str
-    user_answer: str
-
-
-class PendingClarification(BaseModel):
-    original_instruction: str
-    turns: List[ClarificationTurn] = Field(default_factory=list)
-
-    @property
-    def turn_count(self) -> int:
-        return len(self.turns)
-
-    def history_as_text(self) -> str:
-        if not self.turns:
-            return f"最初の要望: {self.original_instruction}"
-        lines = [f"最初の要望: {self.original_instruction}"]
-        for i, t in enumerate(self.turns, start=1):
-            lines.append(f"  Q{i}: {t.question}")
-            lines.append(f"  A{i}: {t.user_answer}")
-        return "\n".join(lines)
-
-    def combined_instruction(self) -> str:
-        parts = [self.original_instruction]
-        for t in self.turns:
-            parts.append(f"（補足質問「{t.question}」への回答: {t.user_answer}）")
-        return " ".join(parts)
-
-
 class PatchStatus(str, Enum):
     SUCCESS = "success"
     NEEDS_CLARIFICATION = "needs_clarification"
@@ -168,7 +177,7 @@ class PatchResult(BaseModel):
     pending_clarification: Optional[PendingClarification] = None
 
 
-_MODIFY_SPRITE_SYSTEM_PROMPT = "対象スプライトの状態と指示に基づき、新しいSpriteSpec互換のJSONを出力してください。"
+_MODIFY_SPRITE_SYSTEM_PROMPT = "対象スプライトの状態と指示に基づき、新しいSpriteSpec互換のJSONを出力してください。既存コスチュームのasset_idは可能な限り引き継いでください。"
 
 
 def handle_modify_sprite(
@@ -188,8 +197,17 @@ def handle_modify_sprite(
     except ValueError as e:
         return PatchResult(status=PatchStatus.FAILED, message=str(e))
 
+    existing_costume_map = {c.name: c.asset_id for c in target_sprite.costumes}
+    merged_costumes = []
+    for c in new_sprite.costumes:
+        aid = c.asset_id or existing_costume_map.get(c.name)
+        merged_costumes.append(c.model_copy(update={"asset_id": aid}))
+    new_sprite = new_sprite.model_copy(update={"costumes": merged_costumes})
+
+    stage = project.stage
     new_sprites = [new_sprite if s.name == sprite_name else s for s in project.sprites]
-    candidate = project.model_copy(update={"sprites": new_sprites})
+    new_targets = ([stage] if stage else []) + new_sprites
+    candidate = project.model_copy(update={"targets": new_targets})
 
     try:
         validated = validate_project_spec(candidate.model_dump())
@@ -250,7 +268,7 @@ def handle_add_sprite(
     if any(s.name == new_sprite.name for s in project.sprites):
         return PatchResult(status=PatchStatus.FAILED, message=f"スプライト名 '{new_sprite.name}' は既に存在します。")
 
-    candidate = project.model_copy(update={"sprites": [*project.sprites, new_sprite]})
+    candidate = project.model_copy(update={"targets": [*project.targets, new_sprite]})
 
     try:
         validated = validate_project_spec(candidate.model_dump())
@@ -264,8 +282,8 @@ def handle_remove_sprite(project: ProjectSpec, sprite_name: str) -> PatchResult:
     if not any(s.name == sprite_name for s in project.sprites):
         return PatchResult(status=PatchStatus.FAILED, message=f"スプライト '{sprite_name}' が見つかりません。")
 
-    new_sprites = [s for s in project.sprites if s.name != sprite_name]
-    candidate = project.model_copy(update={"sprites": new_sprites})
+    new_targets = [t for t in project.targets if t.name != sprite_name]
+    candidate = project.model_copy(update={"targets": new_targets})
 
     try:
         validated = validate_project_spec(candidate.model_dump())
@@ -328,37 +346,52 @@ def apply_patch(
     if pending is not None and pending.turn_count >= MAX_CLARIFICATION_TURNS:
         return PatchResult(status=PatchStatus.FAILED, message=CLARIFICATION_FALLBACK_MESSAGE)
 
+    if pending is not None and pending.current_question:
+        pending.turns.append(
+            ClarificationTurn(
+                question=pending.current_question,
+                user_answer=instruction,
+            )
+        )
+        pending.current_question = None
+
     effective_instruction = pending.combined_instruction() if pending else instruction
 
     try:
-        target = classify_edit_target(instruction, project, llm_call, pending=pending)
+        target = classify_edit_target(effective_instruction, project, llm_call, pending=pending)
     except ValueError as e:
         return PatchResult(status=PatchStatus.FAILED, message=str(e))
 
     if target.target_type == EditTargetType.CLARIFICATION_NEEDED:
         new_pending = pending or PendingClarification(original_instruction=instruction)
+        new_pending.current_question = target.clarification_question
         return PatchResult(
             status=PatchStatus.NEEDS_CLARIFICATION,
             message=target.clarification_question or "詳細を教えてください。",
             pending_clarification=new_pending,
         )
 
+    def _finalize(result: PatchResult) -> PatchResult:
+        if result.status == PatchStatus.SUCCESS and result.project is not None:
+            result.project = reconcile_globals(result.project)
+        return result
+
     if target.target_type == EditTargetType.MODIFY_SPRITE:
         if not target.sprite_name:
             return PatchResult(status=PatchStatus.FAILED, message="スプライト名が特定できません。")
-        return handle_modify_sprite(project, target.sprite_name, effective_instruction, llm_call)
+        return _finalize(handle_modify_sprite(project, target.sprite_name, effective_instruction, llm_call))
 
     if target.target_type == EditTargetType.ADD_SPRITE:
         if materialize_asset is None:
             return PatchResult(status=PatchStatus.FAILED, message="materialize_asset が未注入です。")
-        return handle_add_sprite(project, effective_instruction, llm_call, materialize_asset)
+        return _finalize(handle_add_sprite(project, effective_instruction, llm_call, materialize_asset))
 
     if target.target_type == EditTargetType.REMOVE_SPRITE:
         if not target.sprite_name:
             return PatchResult(status=PatchStatus.FAILED, message="削除対象スプライト名が特定できません。")
-        return handle_remove_sprite(project, target.sprite_name)
+        return _finalize(handle_remove_sprite(project, target.sprite_name))
 
     if target.target_type == EditTargetType.MODIFY_GLOBALS:
-        return handle_modify_globals(project, effective_instruction, llm_call)
+        return _finalize(handle_modify_globals(project, effective_instruction, llm_call))
 
     return PatchResult(status=PatchStatus.FAILED, message=f"未対応の target_type: {target.target_type}")

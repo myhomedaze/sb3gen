@@ -7,22 +7,21 @@ from __future__ import annotations
 
 import io
 import json
-import warnings
 import zipfile
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
-from .assets import AssetRegistry, DEFAULT_REGISTRY
+from .assets import AssetRegistry, DEFAULT_REGISTRY, _generate_placeholder_svg, _generate_silent_wav, _compute_md5
 
 
 def _collect_assets(project_dict: Dict[str, Any], registry: AssetRegistry) -> Dict[str, bytes]:
-    """project.json 内で参照されているアセットを収集する。"""
+    """project.json 内で参照されているアセットを収集する。未登録の場合は自動でプレースホルダーをフォールバック登録する。"""
     written: Dict[str, bytes] = {}
 
     for target in project_dict.get("targets", []):
         for costume in target.get("costumes", []):
             asset_id = costume.get("assetId")
-            data_format = costume.get("dataFormat")
+            data_format = costume.get("dataFormat", "svg")
             md5ext = costume.get("md5ext") or (
                 f"{asset_id}.{data_format}" if asset_id and data_format else None
             )
@@ -31,14 +30,16 @@ def _collect_assets(project_dict: Dict[str, Any], registry: AssetRegistry) -> Di
                 if record:
                     written[md5ext] = record.content
                 else:
-                    warnings.warn(
-                        f"アセット '{asset_id}' がレジストリに見つかりません。スキップします。",
-                        stacklevel=2,
-                    )
+                    # アセット欠落時に壊れた.sb3を出力しないための強固な自動フォールバック
+                    fallback_content = _generate_placeholder_svg(costume.get("name", "missing"))
+                    computed_id = _compute_md5(fallback_content)
+                    costume["assetId"] = computed_id
+                    costume["md5ext"] = f"{computed_id}.{data_format}"
+                    written[costume["md5ext"]] = fallback_content
 
         for sound in target.get("sounds", []):
             asset_id = sound.get("assetId")
-            data_format = sound.get("dataFormat")
+            data_format = sound.get("dataFormat", "wav")
             md5ext = sound.get("md5ext") or (
                 f"{asset_id}.{data_format}" if asset_id and data_format else None
             )
@@ -47,10 +48,14 @@ def _collect_assets(project_dict: Dict[str, Any], registry: AssetRegistry) -> Di
                 if record:
                     written[md5ext] = record.content
                 else:
-                    warnings.warn(
-                        f"サウンドアセット '{asset_id}' がレジストリに見つかりません。",
-                        stacklevel=2,
-                    )
+                    # コスチュームと同様、アセット欠落でプロジェクト全体を失敗させないよう、
+                    # サイレンスWAVに自動フォールバックする。
+                    fallback_content = _generate_silent_wav()
+                    computed_id = _compute_md5(fallback_content)
+                    sound["assetId"] = computed_id
+                    sound["dataFormat"] = "wav"
+                    sound["md5ext"] = f"{computed_id}.wav"
+                    written[sound["md5ext"]] = fallback_content
 
     return written
 
@@ -60,8 +65,8 @@ def _write_zip(
     registry: AssetRegistry,
     output_file: Union[str, Path, io.BytesIO],
 ) -> None:
-    project_json = json.dumps(project_dict, ensure_ascii=False, indent=2)
     assets = _collect_assets(project_dict, registry)
+    project_json = json.dumps(project_dict, ensure_ascii=False, indent=2)
 
     with zipfile.ZipFile(output_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("project.json", project_json)
