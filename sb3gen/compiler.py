@@ -1,7 +1,7 @@
 """
 sb3gen/compiler.py
 BlockSpec の入れ子構造を Scratch 3.0 のフラットなブロックマップ形式に変換し、
-ランダムな ID を採番して parent/next/inputs を結線するコンパイラ層。
+ランダムな ID を採番し, parent/next/inputs を結線するコンパイラ層。
 """
 
 from __future__ import annotations
