@@ -112,7 +112,7 @@ class SoundSpec(BaseModel):
     sample_count: Optional[int] = None
 
 
-OpcodeLiteral = Literal[tuple(sorted(ALLOWED_OPCODES))]
+OpcodeLiteral = Literal[*tuple(sorted(ALLOWED_OPCODES))]
 
 
 class BlockSpec(BaseModel):
@@ -177,6 +177,11 @@ class ProcedureDefinitionSpec(BaseModel):
         return f"{self.name} {arg_part}"
 
 
+class VariableSpec(BaseModel):
+    name: str
+    initial_value: Any = 0
+
+
 class SpriteSpec(BaseModel):
     name: str
     is_stage: bool = False
@@ -189,11 +194,6 @@ class SpriteSpec(BaseModel):
     variables: List[VariableSpec] = Field(default_factory=list)
     scripts: List[ScriptSpec] = Field(default_factory=list)
     procedures: List[ProcedureDefinitionSpec] = Field(default_factory=list)
-
-
-class VariableSpec(BaseModel):
-    name: str
-    initial_value: Any = 0
 
 
 class ListSpec(BaseModel):

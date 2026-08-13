@@ -31,10 +31,14 @@ def _collect_assets(project_dict: Dict[str, Any], registry: AssetRegistry) -> Di
                     written[md5ext] = record.content
                 else:
                     # アセット欠落時に壊れた.sb3を出力しないための強固な自動フォールバック
+                    # プレースホルダーは常にSVGとして生成されるため、dataFormat/拡張子も
+                    # 実際のバイト列に合わせて "svg" に統一する（元のdata_formatを引きずると
+                    # 内容と拡張子が食い違い、Scratch側で読み込めなくなる）。
                     fallback_content = _generate_placeholder_svg(costume.get("name", "missing"))
                     computed_id = _compute_md5(fallback_content)
                     costume["assetId"] = computed_id
-                    costume["md5ext"] = f"{computed_id}.{data_format}"
+                    costume["dataFormat"] = "svg"
+                    costume["md5ext"] = f"{computed_id}.svg"
                     written[costume["md5ext"]] = fallback_content
 
         for sound in target.get("sounds", []):

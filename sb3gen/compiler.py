@@ -472,24 +472,26 @@ def compile_sprite(sprite: SpriteSpec, ctx: CompileContext, layer_order: int = 1
 
     costumes_out = []
     for c in sprite.costumes:
+        c_asset_id = c.asset_id or uuid.uuid4().hex
         costumes_out.append({
             "name": c.name,
             "bitmapResolution": c.bitmap_resolution,
             "dataFormat": c.data_format,
-            "assetId": c.asset_id or uuid.uuid4().hex,
-            "md5ext": c.md5ext or f"{uuid.uuid4().hex}.{c.data_format}",
+            "assetId": c_asset_id,
+            "md5ext": c.md5ext or f"{c_asset_id}.{c.data_format}",
             "rotationCenterX": c.rotation_center_x if c.rotation_center_x is not None else 0,
             "rotationCenterY": c.rotation_center_y if c.rotation_center_y is not None else 0,
         })
 
     sounds_out = []
     for s in sprite.sounds:
+        s_asset_id = s.asset_id or uuid.uuid4().hex
         sounds_out.append({
             "name": s.name,
             "dataFormat": s.data_format,
             "format": "",
-            "assetId": s.asset_id or uuid.uuid4().hex,
-            "md5ext": s.md5ext or f"{uuid.uuid4().hex}.{s.data_format}",
+            "assetId": s_asset_id,
+            "md5ext": s.md5ext or f"{s_asset_id}.{s.data_format}",
             "rate": s.rate if s.rate is not None else 44100,
             "sampleCount": s.sample_count if s.sample_count is not None else 0,
         })
