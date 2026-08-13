@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "templates": {
+    "cat": {
+      "file": "cat.svg",
+      "name": "Cat",
+      "data_format": "svg"
+    }
+  }
+}
