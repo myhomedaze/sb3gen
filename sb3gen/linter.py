@@ -69,37 +69,53 @@ def _collect_from_blocks(blocks: List[BlockSpec], refs: Dict[str, Set[str]]) -> 
             _collect_from_blocks(substack, refs)
 
 
+def _collect_refs_for_target(target) -> Dict[str, Set[str]]:
+    refs: Dict[str, Set[str]] = {"variable": set(), "list": set(), "broadcast": set()}
+    for script in target.scripts:
+        _collect_from_blocks(script.blocks, refs)
+    return refs
+
+
 def collect_referenced_names(project: ProjectSpec) -> Dict[str, Set[str]]:
     """プロジェクト全体のスクリプトが参照している変数/リスト/ブロードキャスト名を集める。"""
     refs: Dict[str, Set[str]] = {"variable": set(), "list": set(), "broadcast": set()}
     for target in project.targets:
-        for script in target.scripts:
-            _collect_from_blocks(script.blocks, refs)
+        target_refs = _collect_refs_for_target(target)
+        for key in refs:
+            refs[key] |= target_refs[key]
     return refs
 
 
 def reconcile_globals(project: ProjectSpec) -> ProjectSpec:
     """
-    スクリプトが参照しているが、まだグローバル定義に存在しない
-    変数/リスト/ブロードキャストを自動的に追加した ProjectSpec を返す。
-    既に存在するものには触れない（差分がなければ同一オブジェクトの浅いコピーを返す）。
+    スクリプトが参照しているが、そのターゲット自身のローカル変数としても
+    グローバル定義としてもまだ存在しない変数/リスト/ブロードキャストを
+    自動的にグローバル定義へ追加した ProjectSpec を返す。
+    既に存在するもの（グローバル定義・当該ターゲットのローカル定義どちらも）には触れない
+    （差分がなければ同一オブジェクトの浅いコピーを返す）。
     """
-    refs = collect_referenced_names(project)
-
     known_vars = {v.name for v in project.variables}
     known_lists = {l.name for l in project.lists}
     known_bcasts = {b.name for b in project.broadcasts}
 
-    missing_vars = sorted(refs["variable"] - known_vars)
-    missing_lists = sorted(refs["list"] - known_lists)
-    missing_bcasts = sorted(refs["broadcast"] - known_bcasts)
+    missing_vars: Set[str] = set()
+    missing_lists: Set[str] = set()
+    missing_bcasts: Set[str] = set()
+
+    for target in project.targets:
+        # スプライト自身にローカル定義されている変数名はグローバル自動登録の対象から除外する
+        local_var_names = {v.name for v in target.variables} if not target.is_stage else set()
+        target_refs = _collect_refs_for_target(target)
+        missing_vars |= (target_refs["variable"] - known_vars - local_var_names)
+        missing_lists |= (target_refs["list"] - known_lists)
+        missing_bcasts |= (target_refs["broadcast"] - known_bcasts)
 
     if not (missing_vars or missing_lists or missing_bcasts):
         return project
 
-    new_vars = list(project.variables) + [VariableSpec(name=n) for n in missing_vars]
-    new_lists = list(project.lists) + [ListSpec(name=n) for n in missing_lists]
-    new_bcasts = list(project.broadcasts) + [BroadcastSpec(name=n) for n in missing_bcasts]
+    new_vars = list(project.variables) + [VariableSpec(name=n) for n in sorted(missing_vars)]
+    new_lists = list(project.lists) + [ListSpec(name=n) for n in sorted(missing_lists)]
+    new_bcasts = list(project.broadcasts) + [BroadcastSpec(name=n) for n in sorted(missing_bcasts)]
 
     return project.model_copy(
         update={

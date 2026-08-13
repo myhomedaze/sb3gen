@@ -10,7 +10,16 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from .assets import AssetRegistry, register_default_backdrop
-from .schema import ProjectSpec, SpriteSpec, BlockSpec, ScriptSpec, CostumeSpec, ALLOWED_OPCODES
+from .schema import (
+    ProjectSpec,
+    SpriteSpec,
+    BlockSpec,
+    ScriptSpec,
+    CostumeSpec,
+    ALLOWED_OPCODES,
+    ProcedureDefinitionSpec,
+    extension_id_for_opcode,
+)
 
 BLOCK_DEFS: Dict[str, Dict[str, Any]] = {
     "motion_movesteps": {"inputs": ["STEPS"], "substacks": []},
@@ -89,7 +98,7 @@ BLOCK_DEFS: Dict[str, Dict[str, Any]] = {
     "sensing_distanceto": {"inputs": ["DISTANCETOMENU"], "substacks": []},
     "sensing_askandwait": {"inputs": ["QUESTION"], "substacks": []},
     "sensing_answer": {"inputs": [], "substacks": []},
-    "sensing_keypressed": {"inputs": ["KEY_OPTION"], "inputs": [], "substacks": []},
+    "sensing_keypressed": {"inputs": ["KEY_OPTION"], "substacks": []},
     "sensing_mousedown": {"inputs": [], "substacks": []},
     "sensing_mousex": {"inputs": [], "substacks": []},
     "sensing_mousey": {"inputs": [], "substacks": []},
@@ -146,8 +155,46 @@ class CompileContext:
         self.variable_ids: Dict[str, str] = {v.name: uuid.uuid4().hex[:20] for v in project.variables}
         self.list_ids: Dict[str, str] = {l.name: uuid.uuid4().hex[:20] for l in project.lists}
         self.broadcast_ids: Dict[str, str] = {b.name: uuid.uuid4().hex[:20] for b in project.broadcasts}
+        # スプライトごとのローカル変数IDテーブル（スプライト名 -> {変数名: ID}）
+        self._local_variable_ids: Dict[str, Dict[str, str]] = {}
+        self._active_sprite_name: Optional[str] = None
+        # 現在コンパイル中のターゲットが持つカスタムブロック定義（名前 -> 定義）。
+        # procedures_call の mutation を組み立てる際に proc_name から引く（1番: カスタムブロック）。
+        self._active_procedures: Dict[str, ProcedureDefinitionSpec] = {}
+        # プロジェクト全体を通して実際に使用された拡張機能ID（2番: 拡張機能）。
+        # _compile_node でopcodeをコンパイルするたびに extension_id_for_opcode で判定し追加する。
+        # 最終的に compile_project が project.json トップレベルの "extensions" 配列として書き出す。
+        self.extensions: set[str] = set()
+
+    def enter_sprite(self, sprite: "SpriteSpec") -> None:
+        """これから compile_script するスプライトのスコープを設定する。
+        ステージ（is_stage=True）の場合はローカルスコープなし（常にグローバル解決）。
+        非ステージの場合は sprite.variables をこのスプライトのローカル変数として事前登録する。
+        カスタムブロック定義（procedures）はステージ・スプライトどちらでも保持する。
+        """
+        self._active_procedures = {p.name: p for p in sprite.procedures}
+        if sprite.is_stage:
+            self._active_sprite_name = None
+            return
+        self._active_sprite_name = sprite.name
+        if sprite.name not in self._local_variable_ids:
+            self._local_variable_ids[sprite.name] = {
+                v.name: uuid.uuid4().hex[:20] for v in sprite.variables
+            }
+
+    def lookup_procedure(self, proc_name: str) -> Optional[ProcedureDefinitionSpec]:
+        return self._active_procedures.get(proc_name)
+
+    def local_variables_for(self, sprite_name: str) -> Dict[str, str]:
+        return self._local_variable_ids.get(sprite_name, {})
 
     def resolve_variable(self, name: str) -> str:
+        """変数名からIDを解決する。現在アクティブなスプライトのローカル変数を優先し、
+        見つからなければグローバル変数を検索（未登録ならグローバルとして新規作成）する。"""
+        if self._active_sprite_name is not None:
+            local_map = self._local_variable_ids.setdefault(self._active_sprite_name, {})
+            if name in local_map:
+                return local_map[name]
         if name not in self.variable_ids:
             self.variable_ids[name] = uuid.uuid4().hex[:20]
         return self.variable_ids[name]
@@ -167,6 +214,33 @@ def generate_id() -> str:
     return uuid.uuid4().hex[:20]
 
 
+def _build_mutation(proc: ProcedureDefinitionSpec) -> Dict[str, Any]:
+    """ProcedureDefinitionSpec から、procedures_definition/procedures_prototype/
+    procedures_call が共通で持つ mutation 構造（proccode・引数id/名前/既定値・warp）を組み立てる（1番）。
+
+    引数IDには ProcedureArgumentSpec.name をそのまま使う。schema.validate_project_spec で
+    同一カスタムブロック内の引数名の重複はすでに禁止されているため、id としても一意性が保たれる。
+    これにより呼び出し側（procedures_call の BlockSpec.inputs）は引数名をキーにするだけでよく、
+    内部的な argument id を別途意識する必要がない。
+    """
+    arg_ids = [a.name for a in proc.arguments]
+    arg_defaults: List[str] = []
+    for a in proc.arguments:
+        if a.default is not None:
+            arg_defaults.append(str(a.default))
+        else:
+            arg_defaults.append("false" if a.type == "boolean" else "")
+    return {
+        "tagName": "mutation",
+        "children": [],
+        "proccode": proc.proccode,
+        "argumentids": json.dumps(arg_ids, ensure_ascii=False),
+        "argumentnames": json.dumps(arg_ids, ensure_ascii=False),
+        "argumentdefaults": json.dumps(arg_defaults, ensure_ascii=False),
+        "warp": "true" if proc.warp else "false",
+    }
+
+
 def _compile_node(
     block: BlockSpec,
     blocks_out: Dict[str, Any],
@@ -178,7 +252,24 @@ def _compile_node(
         raise ValueError(f"許可されていないopcodeです: {block.opcode}")
 
     block_id = generate_id()
-    
+
+    # このopcodeが拡張機能（ペン・音楽等）のブロックであれば、プロジェクト全体の
+    # 使用済み拡張機能セットに登録する（2番: 拡張機能）。
+    ext_id = extension_id_for_opcode(block.opcode)
+    if ext_id:
+        ctx.extensions.add(ext_id)
+
+    # procedures_call ブロックの場合、対象のカスタムブロック定義から mutation
+    # （proccode・argumentids・argumentnames・argumentdefaults・warp）を組み立てる（1番）。
+    # schema.validate_project_spec で proc_name の存在チェック済みだが、コンパイル単体で
+    # 呼ばれるケースも考慮し、ここでも未定義なら明示的にエラーにする。
+    call_mutation: Optional[Dict[str, Any]] = None
+    if block.opcode == "procedures_call":
+        proc = ctx.lookup_procedure(block.proc_name) if block.proc_name else None
+        if proc is None:
+            raise ValueError(f"未定義のカスタムブロックを呼び出しています: {block.proc_name}")
+        call_mutation = _build_mutation(proc)
+
     # fieldsの解決（変数、リスト、ブロードキャストのID紐付け）
     compiled_fields = dict(block.fields)
     if block.opcode in {"data_variable", "data_setvariableto", "data_changevariableby", "data_showvariable", "data_hidevariable"}:
@@ -209,6 +300,16 @@ def _compile_node(
                 b_name = b_name[0]
             b_id = ctx.resolve_broadcast(str(b_name))
             compiled_fields["BROADCAST_OPTION"] = [str(b_name), b_id]
+    elif block.opcode in {"argument_reporter_string_number", "argument_reporter_boolean"}:
+        # カスタムブロック本体内で引数を参照するレポーター（1番）。
+        # LLM/呼び出し側が "VALUE": "引数名" のように素の文字列で渡してきても、
+        # Scratchが期待する [引数名, null] 形式に正規化する。
+        if "VALUE" in compiled_fields:
+            v = compiled_fields["VALUE"]
+            if isinstance(v, list):
+                compiled_fields["VALUE"] = [str(v[0]) if v else "", None]
+            else:
+                compiled_fields["VALUE"] = [str(v), None]
 
     # inputsのコンパイル（ネストしたBlockSpecや辞書、プリミティブ値の処理）
     compiled_inputs: Dict[str, Any] = {}
@@ -261,7 +362,7 @@ def _compile_node(
         else:
             compiled_inputs[substack_key] = [2, None]
 
-    blocks_out[block_id] = {
+    compiled_block: Dict[str, Any] = {
         "opcode": block.opcode,
         "next": next_id,
         "parent": parent_id,
@@ -270,6 +371,9 @@ def _compile_node(
         "shadow": False,
         "topLevel": (parent_id is None and next_id != "PENDING")
     }
+    if call_mutation is not None:
+        compiled_block["mutation"] = call_mutation
+    blocks_out[block_id] = compiled_block
     return block_id
 
 
@@ -294,10 +398,77 @@ def compile_script(script: ScriptSpec, blocks_out: Dict[str, Any], ctx: CompileC
     return first_id
 
 
-def compile_sprite(sprite: SpriteSpec, ctx: CompileContext) -> Dict[str, Any]:
+def _compile_procedure(proc: ProcedureDefinitionSpec, blocks_out: Dict[str, Any], ctx: CompileContext) -> None:
+    """ProcedureDefinitionSpec（カスタムブロック宣言）を、Scratchが読み込める
+    procedures_definition（hatブロック）+ procedures_prototype（隠しshadowブロック）+
+    各引数の argument_reporter_* ブロック + 本体スクリプトへとコンパイルする（1番: カスタムブロック）。
+
+    procedures_prototype の inputs は、各引数idをキーに argument_reporter ブロックを
+    shadowとして参照する（Scratch側の「マイブロックの定義」パレット表示に必要）。
+    本体スクリプトは procedures_definition の next として連結する。
+    """
+    mutation = _build_mutation(proc)
+
+    prototype_id = generate_id()
+    definition_id = generate_id()
+
+    prototype_inputs: Dict[str, Any] = {}
+    for arg in proc.arguments:
+        reporter_id = generate_id()
+        reporter_opcode = (
+            "argument_reporter_boolean" if arg.type == "boolean" else "argument_reporter_string_number"
+        )
+        blocks_out[reporter_id] = {
+            "opcode": reporter_opcode,
+            "next": None,
+            "parent": prototype_id,
+            "inputs": {},
+            "fields": {"VALUE": [arg.name, None]},
+            "shadow": True,
+            "topLevel": False,
+        }
+        prototype_inputs[arg.name] = [1, reporter_id]
+
+    blocks_out[prototype_id] = {
+        "opcode": "procedures_prototype",
+        "next": None,
+        "parent": definition_id,
+        "inputs": prototype_inputs,
+        "fields": {},
+        "mutation": mutation,
+        "shadow": True,
+        "topLevel": False,
+    }
+
+    # 本体スクリプトをコンパイルし、definitionブロックの next として連結する。
+    # compile_scriptは先頭ブロックをtopLevel=True・parent=Noneにするため、
+    # ここで本体の先頭ブロックのparent/topLevelをdefinitionブロックの子として上書きする。
+    first_body_id = compile_script(ScriptSpec(blocks=proc.body), blocks_out, ctx)
+    if first_body_id is not None:
+        blocks_out[first_body_id]["parent"] = definition_id
+        blocks_out[first_body_id]["topLevel"] = False
+
+    blocks_out[definition_id] = {
+        "opcode": "procedures_definition",
+        "next": first_body_id,
+        "parent": None,
+        "inputs": {"custom_block": [1, prototype_id]},
+        "fields": {},
+        "shadow": False,
+        "topLevel": True,
+    }
+
+
+def compile_sprite(sprite: SpriteSpec, ctx: CompileContext, layer_order: int = 1) -> Dict[str, Any]:
+    ctx.enter_sprite(sprite)
+
     blocks_out: Dict[str, Any] = {}
     for script in sprite.scripts:
         compile_script(script, blocks_out, ctx)
+
+    # このターゲットが宣言しているカスタムブロック定義を、hatブロックから本体まで一括コンパイルする（1番）。
+    for proc in sprite.procedures:
+        _compile_procedure(proc, blocks_out, ctx)
 
     costumes_out = []
     for c in sprite.costumes:
@@ -306,22 +477,45 @@ def compile_sprite(sprite: SpriteSpec, ctx: CompileContext) -> Dict[str, Any]:
             "bitmapResolution": c.bitmap_resolution,
             "dataFormat": c.data_format,
             "assetId": c.asset_id or uuid.uuid4().hex,
-            "md5ext": c.md5ext or f"{uuid.uuid4().hex}.{c.data_format}"
+            "md5ext": c.md5ext or f"{uuid.uuid4().hex}.{c.data_format}",
+            "rotationCenterX": c.rotation_center_x if c.rotation_center_x is not None else 0,
+            "rotationCenterY": c.rotation_center_y if c.rotation_center_y is not None else 0,
         })
+
+    sounds_out = []
+    for s in sprite.sounds:
+        sounds_out.append({
+            "name": s.name,
+            "dataFormat": s.data_format,
+            "format": "",
+            "assetId": s.asset_id or uuid.uuid4().hex,
+            "md5ext": s.md5ext or f"{uuid.uuid4().hex}.{s.data_format}",
+            "rate": s.rate if s.rate is not None else 44100,
+            "sampleCount": s.sample_count if s.sample_count is not None else 0,
+        })
+
+    # スプライトローカル変数を project.json の variables に書き出す（ステージは常に空。
+    # グローバル変数は compile_project 側でステージターゲットに別途割り当てられる）。
+    local_var_ids = ctx.local_variables_for(sprite.name) if not sprite.is_stage else {}
+    local_var_defaults = {v.name: v.initial_value for v in sprite.variables}
+    variables_out = {
+        v_id: [name, local_var_defaults.get(name, 0)]
+        for name, v_id in local_var_ids.items()
+    }
 
     return {
         "isStage": sprite.is_stage,
         "name": sprite.name,
-        "variables": {},
+        "variables": variables_out,
         "lists": {},
         "broadcasts": {},
         "blocks": blocks_out,
         "comments": {},
         "currentCostume": 0,
         "costumes": costumes_out,
-        "sounds": [],
+        "sounds": sounds_out,
         "volume": 100,
-        "layerOrder": 1 if not sprite.is_stage else 0,
+        "layerOrder": layer_order if not sprite.is_stage else 0,
         "visible": sprite.visible,
         "x": sprite.x,
         "y": sprite.y,
@@ -346,8 +540,13 @@ def compile_project(project: ProjectSpec, registry: Optional[AssetRegistry] = No
 
     ctx = CompileContext(project)
     targets_out = []
+    next_layer_order = 1
     for sprite in project.targets:
-        targets_out.append(compile_sprite(sprite, ctx))
+        if sprite.is_stage:
+            targets_out.append(compile_sprite(sprite, ctx))
+        else:
+            targets_out.append(compile_sprite(sprite, ctx, layer_order=next_layer_order))
+            next_layer_order += 1
 
     variable_defaults = {v.name: v.initial_value for v in project.variables}
     list_defaults = {l.name: l.items for l in project.lists}
@@ -372,6 +571,10 @@ def compile_project(project: ProjectSpec, registry: Optional[AssetRegistry] = No
 
     return {
         "targets": targets_out,
+        # 実際に使用された拡張機能IDのみを宣言する（2番: 拡張機能）。
+        # これが無いと pen_*/music_* ブロックを含むプロジェクトはScratch上で
+        # 拡張機能未ロードのままになり、対応ブロックが正しく表示・実行されない。
+        "extensions": sorted(ctx.extensions),
         "meta": {
             "semver": "3.0.0",
             "vm": "0.2.0",
