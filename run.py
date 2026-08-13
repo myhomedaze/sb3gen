@@ -10,7 +10,9 @@ import json
 import os
 import sys
 import time
-from typing import Optional
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, Union
 
 from sb3gen.main import generate_sb3
 
@@ -187,10 +189,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output",
-        default="output_project.sb3",
-        help="出力先の .sb3 ファイルパス（デフォルト: output_project.sb3）",
+        default=None,
+        help="出力先の .sb3 ファイルパス（未指定の場合は実行のたびにタイムスタンプ付きの"
+        "ファイル名を自動生成し、既存ファイルを上書きしません）",
     )
     return parser.parse_args()
+
+
+def generate_output_path(directory: Union[str, Path] = ".") -> Path:
+    """タイムスタンプ付きの出力先パスを生成する。同名ファイルが既にあれば連番を付ける。"""
+    base_dir = Path(directory)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    candidate = base_dir / f"output_{timestamp}.sb3"
+    counter = 1
+    while candidate.exists():
+        candidate = base_dir / f"output_{timestamp}_{counter}.sb3"
+        counter += 1
+    return candidate
 
 
 if __name__ == "__main__":
@@ -198,6 +213,8 @@ if __name__ == "__main__":
 
     provider = resolve_provider(args.provider)
     llm_call = with_retry(PROVIDER_BUILDERS[provider]())
+
+    output_path = Path(args.output) if args.output else generate_output_path()
 
     user_instruction = (
         args.instruction
@@ -210,9 +227,9 @@ if __name__ == "__main__":
         generate_sb3(
             instruction=user_instruction,
             llm_call=llm_call,
-            output_path=args.output,
+            output_path=output_path,
         )
-        print(f"生成が完了しました: {args.output}")
+        print(f"生成が完了しました: {output_path}")
     except Exception as e:
         print(f"エラーが発生しました: {e}", file=sys.stderr)
         sys.exit(1)
