@@ -87,19 +87,29 @@ def _generate_with_retry(
     )
 
 
-class EditTargetType(str, Enum):
+class ActionType(str, Enum):
     MODIFY_SPRITE = "modify_sprite"
     ADD_SPRITE = "add_sprite"
     REMOVE_SPRITE = "remove_sprite"
     MODIFY_GLOBALS = "modify_globals"
-    CLARIFICATION_NEEDED = "clarification_needed"
 
 
-class EditTarget(BaseModel):
-    target_type: EditTargetType
-    sprite_name: Optional[str] = Field(default=None)
+class ActionSpec(BaseModel):
+    """計画フェーズが出力する、単一の編集操作単位。"""
+
+    type: ActionType
+    target: Optional[str] = Field(
+        default=None, description="modify_sprite / remove_sprite の対象スプライト名"
+    )
+    instruction: str = Field(description="このアクション固有の具体的な指示文")
+
+
+class ActionPlan(BaseModel):
+    """ユーザーの自然言語指示を分解した実行計画。"""
+
+    actions: List[ActionSpec] = Field(default_factory=list)
+    clarification_needed: bool = False
     clarification_question: Optional[str] = Field(default=None)
-    raw_instruction: str = Field(default="")
 
 
 class ClarificationTurn(BaseModel):
@@ -132,22 +142,30 @@ class PendingClarification(BaseModel):
         return " ".join(parts)
 
 
-_CLASSIFY_SYSTEM_PROMPT = """あなたはScratch 3.0プロジェクト編集システムの指示分類器です。
-ユーザーの自然言語指示を解析し、次のいずれか一つに分類してください:
-- modify_sprite: 既存の特定スプライトを変更する
+_PLANNING_SYSTEM_PROMPT = """あなたはScratch 3.0プロジェクト編集システムの計画立案者です。
+ユーザーの自然言語指示を解析し、実行すべき一連のアクションに分解してください。
+
+各アクションは以下のいずれかのtypeを持ちます:
 - add_sprite: 新しいスプライトを追加する
-- remove_sprite: 既存のスプライトを削除する
+- modify_sprite: 既存の特定スプライトを変更する（targetに対象スプライト名を指定）
+- remove_sprite: 既存のスプライトを削除する（targetに対象スプライト名を指定）
 - modify_globals: グローバル変数・リスト・ブロードキャストの変更
-- clarification_needed: 対象や意図が曖昧で確定できない
+
+指示が複数の要素を含む場合は、それぞれを独立したアクションに分解し、
+実行すべき順序で並べてください。後続のアクションが前のアクションで
+作られる要素（スプライト名など）を参照する場合は、instructionに明記してください。
+
+指示全体が曖昧な場合のみ clarification_needed を true にし、
+clarification_question に質問文を設定してください（その場合 actions は空リスト）。
 """
 
 
-def classify_edit_target(
+def plan_instruction(
     instruction: str,
     project: ProjectSpec,
     llm_call: LLMCallable,
     pending: Optional[PendingClarification] = None,
-) -> EditTarget:
+) -> ActionPlan:
     sprite_names = [s.name for s in project.sprites]
     history_text = pending.history_as_text() if pending else ""
 
@@ -157,11 +175,7 @@ def classify_edit_target(
         + f"ユーザーの指示: {instruction}\n"
     )
 
-    target = _generate_with_retry(
-        _CLASSIFY_SYSTEM_PROMPT, user_prompt, EditTarget, llm_call
-    )
-    target.raw_instruction = instruction
-    return target
+    return _generate_with_retry(_PLANNING_SYSTEM_PROMPT, user_prompt, ActionPlan, llm_call)
 
 
 class PatchStatus(str, Enum):
@@ -170,11 +184,18 @@ class PatchStatus(str, Enum):
     FAILED = "failed"
 
 
+class ActionResult(BaseModel):
+    action: ActionSpec
+    status: PatchStatus
+    message: Optional[str] = None
+
+
 class PatchResult(BaseModel):
     status: PatchStatus
     project: Optional[ProjectSpec] = None
     message: Optional[str] = None
     pending_clarification: Optional[PendingClarification] = None
+    action_results: List[ActionResult] = Field(default_factory=list)
 
 
 _MODIFY_SPRITE_SYSTEM_PROMPT = "対象スプライトの状態と指示に基づき、新しいSpriteSpec互換のJSONを出力してください。既存コスチュームのasset_idは可能な限り引き継いでください。"
@@ -336,6 +357,33 @@ def handle_modify_globals(
     return PatchResult(status=PatchStatus.SUCCESS, project=validated)
 
 
+def _execute_action(
+    project: ProjectSpec,
+    action: ActionSpec,
+    llm_call: LLMCallable,
+    materialize_asset: Optional[MaterializeAssetCallable],
+) -> PatchResult:
+    if action.type == ActionType.MODIFY_SPRITE:
+        if not action.target:
+            return PatchResult(status=PatchStatus.FAILED, message="スプライト名が特定できません。")
+        return handle_modify_sprite(project, action.target, action.instruction, llm_call)
+
+    if action.type == ActionType.ADD_SPRITE:
+        if materialize_asset is None:
+            return PatchResult(status=PatchStatus.FAILED, message="materialize_asset が未注入です。")
+        return handle_add_sprite(project, action.instruction, llm_call, materialize_asset)
+
+    if action.type == ActionType.REMOVE_SPRITE:
+        if not action.target:
+            return PatchResult(status=PatchStatus.FAILED, message="削除対象スプライト名が特定できません。")
+        return handle_remove_sprite(project, action.target)
+
+    if action.type == ActionType.MODIFY_GLOBALS:
+        return handle_modify_globals(project, action.instruction, llm_call)
+
+    return PatchResult(status=PatchStatus.FAILED, message=f"未対応の action type: {action.type}")
+
+
 def apply_patch(
     project: ProjectSpec,
     instruction: str,
@@ -358,40 +406,42 @@ def apply_patch(
     effective_instruction = pending.combined_instruction() if pending else instruction
 
     try:
-        target = classify_edit_target(effective_instruction, project, llm_call, pending=pending)
+        plan = plan_instruction(effective_instruction, project, llm_call, pending=pending)
     except ValueError as e:
         return PatchResult(status=PatchStatus.FAILED, message=str(e))
 
-    if target.target_type == EditTargetType.CLARIFICATION_NEEDED:
+    if plan.clarification_needed or not plan.actions:
         new_pending = pending or PendingClarification(original_instruction=instruction)
-        new_pending.current_question = target.clarification_question
+        new_pending.current_question = plan.clarification_question
         return PatchResult(
             status=PatchStatus.NEEDS_CLARIFICATION,
-            message=target.clarification_question or "詳細を教えてください。",
+            message=plan.clarification_question or "詳細を教えてください。",
             pending_clarification=new_pending,
         )
 
-    def _finalize(result: PatchResult) -> PatchResult:
+    current_project = project
+    action_results: List[ActionResult] = []
+
+    for action in plan.actions:
+        result = _execute_action(current_project, action, llm_call, materialize_asset)
+        action_results.append(
+            ActionResult(action=action, status=result.status, message=result.message)
+        )
+
         if result.status == PatchStatus.SUCCESS and result.project is not None:
-            result.project = reconcile_globals(result.project)
-        return result
+            current_project = reconcile_globals(result.project)
+            continue
 
-    if target.target_type == EditTargetType.MODIFY_SPRITE:
-        if not target.sprite_name:
-            return PatchResult(status=PatchStatus.FAILED, message="スプライト名が特定できません。")
-        return _finalize(handle_modify_sprite(project, target.sprite_name, effective_instruction, llm_call))
+        # 途中失敗: それまでの成功分（current_project）は保持したまま報告して中断する。
+        return PatchResult(
+            status=PatchStatus.FAILED,
+            project=current_project,
+            message=(
+                f"アクション {len(action_results)}/{len(plan.actions)} 番目"
+                f"（{action.type.value}）で失敗しました: {result.message}\n"
+                f"それまでの変更（{len(action_results) - 1}件）は保持されています。"
+            ),
+            action_results=action_results,
+        )
 
-    if target.target_type == EditTargetType.ADD_SPRITE:
-        if materialize_asset is None:
-            return PatchResult(status=PatchStatus.FAILED, message="materialize_asset が未注入です。")
-        return _finalize(handle_add_sprite(project, effective_instruction, llm_call, materialize_asset))
-
-    if target.target_type == EditTargetType.REMOVE_SPRITE:
-        if not target.sprite_name:
-            return PatchResult(status=PatchStatus.FAILED, message="削除対象スプライト名が特定できません。")
-        return _finalize(handle_remove_sprite(project, target.sprite_name))
-
-    if target.target_type == EditTargetType.MODIFY_GLOBALS:
-        return _finalize(handle_modify_globals(project, effective_instruction, llm_call))
-
-    return PatchResult(status=PatchStatus.FAILED, message=f"未対応の target_type: {target.target_type}")
+    return PatchResult(status=PatchStatus.SUCCESS, project=current_project, action_results=action_results)
