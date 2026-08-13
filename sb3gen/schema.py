@@ -112,8 +112,11 @@ class SoundSpec(BaseModel):
     sample_count: Optional[int] = None
 
 
+OpcodeLiteral = Literal[tuple(sorted(ALLOWED_OPCODES))]
+
+
 class BlockSpec(BaseModel):
-    opcode: str
+    opcode: OpcodeLiteral
     fields: Dict[str, Any] = Field(default_factory=dict)
     inputs: Dict[str, Any] = Field(default_factory=dict)
     substacks: List[List[BlockSpec]] = Field(default_factory=list)
