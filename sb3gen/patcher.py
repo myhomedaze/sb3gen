@@ -56,14 +56,22 @@ _PROCEDURE_BODY_SYSTEM_PROMPT = (
 
 
 class ScriptPlanItem(BaseModel):
-    """スプライト生成の第1段階で出力される、スクリプト一本分の軸となる要約。
+    """スプライト生成の第1段階で出力される、スクリプト一本分の計画。
 
     blocksの詳細（ブロック木）はこの段階では出力させず、後続の段階で
-    この要約を手がかりにスクリプトを、1本ずつ個別にLLM呼び出しして生成する（7番）。
+    この計画を手がかりにスクリプトを、1本ずつ個別にLLM呼び出しして生成する（7番）。
     """
 
     summary: str = Field(
-        description="このスクリプトが行うことの簡潔な要約（例: 「旗クリックで10歩動く」）"
+        description="このスクリプトが行うことの簡潔な要約（例: 「旗クリックで10歩動く」）。"
+        "他のスクリプトへ文脈として渡す短い説明でよい。"
+    )
+    reference_detail: Optional[str] = Field(
+        default=None,
+        description="参考情報に、このスクリプトに対応する元の詳細ロジック（疑似コード・"
+        "具体的な計算式・条件分岐・ブロックの並び順など）が含まれている場合、それを要約せず"
+        "できるだけそのまま書き写したもの（忠実な再現用）。新規に考案するスクリプトの場合は"
+        "省略してよい。"
     )
 
 
@@ -89,6 +97,13 @@ class ProcedurePlanItem(BaseModel):
     warp: bool = False
     summary: str = Field(
         description="このカスタムブロック（マイブロック）が行うことの簡潔な要約"
+    )
+    reference_detail: Optional[str] = Field(
+        default=None,
+        description="参考情報に、このカスタムブロックに対応する元の詳細ロジック（疑似コード・"
+        "具体的な計算式・条件分岐・ブロックの並び順など）が含まれている場合、それを要約せず"
+        "できるだけそのまま書き写したもの（忠実な再現用）。新規に考案するカスタムブロックの場合は"
+        "省略してよい。"
     )
 
 
@@ -145,6 +160,13 @@ def _generate_sprite_chunked(
         )
         if existing_scripts_context:
             prompt += f"参考（既存のスクリプト文脈）:\n{existing_scripts_context}\n"
+        if plan_item.reference_detail:
+            prompt += (
+                "【重要】以下は、このスクリプトが再現すべき元の詳細ロジックです。"
+                "要約したり独自の実装に置き換えたりせず、変数名・計算式・条件分岐・"
+                "ブロックの並び順をできる限り忠実に再現してください:\n"
+                f"{plan_item.reference_detail}\n"
+            )
         prompt += f"このスクリプトで実装すべき内容: {plan_item.summary}\n"
         return prompt
 
@@ -180,6 +202,13 @@ def _generate_sprite_chunked(
         )
         if existing_scripts_context:
             prompt += f"参考（既存のスクリプト・カスタムブロック文脈）:\n{existing_scripts_context}\n"
+        if plan_item.reference_detail:
+            prompt += (
+                "【重要】以下は、このカスタムブロックが再現すべき元の詳細ロジックです。"
+                "要約したり独自の実装に置き換えたりせず、変数名・計算式・条件分岐・"
+                "ブロックの並び順をできる限り忠実に再現してください:\n"
+                f"{plan_item.reference_detail}\n"
+            )
         prompt += f"このカスタムブロックの本体で実装すべき内容: {plan_item.summary}\n"
         return prompt
 
@@ -302,6 +331,12 @@ clarification_questions に、ユーザーへ確認したい質問を最大3件�
 作成であるべきなので add_sprite を使ってください（そのスプライトが持つべき内容は instruction に
 具体的に書いてください）。
 
+【重要】指示文中に「参考情報」として既存プロジェクトの疑似コード（sprite ... end 形式）が
+含まれていて、その内容を基にスプライトを忠実に作成/修正する必要がある場合、add_sprite /
+modify_sprite の instruction には、対象スプライトに関連する参考情報の疑似コードを要約せずできる限り
+そのまま（変数名・計算式・条件分岐・ブロックの並び順を保ったまま）含めてください。「〜のような動きをする
+スプライト」のような短い言い換えに圧縮しないこと。instructionが長くなっても構いません。
+
 指示文中に「これ以上質問せずactionsを生成してください」といった、デフォルト値での
 進行を許可する旨の記述が含まれている場合は、以後 clarification_needed を true にせず、
 不明点は妥当なデフォルト値で補ったうえで必ず actions を生成してください。
@@ -362,6 +397,10 @@ _MODIFY_SPRITE_SHELL_SYSTEM_PROMPT = (
     "このスプライトが定義すべきカスタムブロック（マイブロック）がある場合は、"
     "procedure_planフィールドに、それぞれの名前・引数（arguments）・warp・本体の簡潔な要約(summary)"
     "のみを出力してください（本体のブロック木はこの段階では出力しないでください）。"
+    "【重要】指示文中に参考情報（既存プロジェクトの疑似コードなど）が含まれていて、"
+    "あるスクリプトやカスタムブロックを忠実に再現する必要がある場合は、その対応する部分を"
+    "script_plan[].reference_detail や procedure_plan[].reference_detail に、要約せず元の疑似コードを"
+    "できるだけそのまま転記してください（summaryは別途短い説明を入れる）。"
 )
 
 _MODIFY_SPRITE_SCRIPT_SYSTEM_PROMPT = (
@@ -469,6 +508,10 @@ _ADD_SPRITE_SHELL_SYSTEM_PROMPT = (
     "このスプライトが定義すべきカスタムブロック（マイブロック）がある場合は、"
     "procedure_planフィールドに、それぞれの名前・引数（arguments）・warp・本体の簡潔な要約(summary)"
     "のみを出力してください（本体のブロック木はこの段階では出力しないでください）。"
+    "【重要】指示文中に参考情報（既存プロジェクトの疑似コードなど）が含まれていて、"
+    "あるスクリプトやカスタムブロックを忠実に再現する必要がある場合は、その対応する部分を"
+    "script_plan[].reference_detail や procedure_plan[].reference_detail に、要約せず元の疑似コードを"
+    "できるだけそのまま転記してください（summaryは別途短い説明を入れる）。"
 )
 
 _ADD_SPRITE_SCRIPT_SYSTEM_PROMPT = (

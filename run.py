@@ -93,6 +93,17 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     return any(marker.lower() in message for marker in _RATE_LIMIT_MARKERS)
 
 
+def _is_daily_quota_exhausted(exc: Exception) -> bool:
+    """1日あたりのAPIクォータを使い切ったことを示すエラーかどうかを判定する。
+    このエラーは（サーバーが retryDelay を示していても）何秒待っても解消しないため、
+    自動リトライや『もう一度実行しますか？』の確認の対象から外し、即座に終了させる。
+    """
+    message = str(exc).lower()
+    if not any(marker in message for marker in ("429", "resource_exhausted")):
+        return False
+    return any(marker in message for marker in _NON_RETRYABLE_QUOTA_MARKERS)
+
+
 # ---------------------------------------------------------------------------
 # 呼び出しペースの自動調整（プロバイダ横断・特定モデルの数値をハードコードしない）
 # ---------------------------------------------------------------------------
@@ -145,6 +156,65 @@ class _PacedCaller:
         self._min_interval = widened
 
 
+def _countdown_sleep(total_seconds: float, stream=sys.stderr) -> None:
+    """指定秒数待機しつつ、経過を1秒ごとに「N秒待機します（x/N秒）」の形で表示する。"""
+    total_int = max(1, round(total_seconds))
+    for elapsed in range(1, total_int + 1):
+        print(f"\r{total_int}秒待機します（{elapsed}/{total_int}秒）", end="", file=stream, flush=True)
+        time.sleep(1)
+    print(file=stream)
+
+
+def _input_with_timeout(prompt: str, timeout: float, default: str) -> str:
+    """標準入力をtimeout秒待ち、入力が無ければdefaultを返す。
+
+    以前は別スレッドで input() を呼ぶ方式だったが、Pythonの input() は外から中断できず、
+    タイムアウトしてもスレッド自体は標準入力を待ち続けるため、次回の確認プロンプトと
+    入力を取り合い、ユーザーの入力が古いスレッドに吐われて意図しない方に判定される
+    バグがあった。この問題を避けるため、スレッドを使わずキー入力をポーリングする方式に変えている。
+    """
+    print(prompt, end="", flush=True)
+    if os.name == "nt":
+        return _input_with_timeout_windows(timeout, default)
+    return _input_with_timeout_unix(timeout, default)
+
+
+def _input_with_timeout_windows(timeout: float, default: str) -> str:
+    """Windows向け。msvcrtでキー入力をポーリングし、ブロッキングしない。"""
+    import msvcrt
+
+    start = time.monotonic()
+    buffer: List[str] = []
+    while True:
+        while msvcrt.kbhit():
+            ch = msvcrt.getwche()
+            if ch in ("\r", "\n"):
+                print()
+                return "".join(buffer)
+            if ch == "\b":
+                if buffer:
+                    buffer.pop()
+                    print(" \b", end="", flush=True)
+                continue
+            buffer.append(ch)
+        if time.monotonic() - start > timeout:
+            print(f"\n{timeout:.0f}秒間入力がなかったため、自動的に '{default}' として続行します。")
+            return default
+        time.sleep(0.05)
+
+
+def _input_with_timeout_unix(timeout: float, default: str) -> str:
+    """Unix系向け。selectで標準入力の準備を待つ。"""
+    import select
+
+    rlist, _, _ = select.select([sys.stdin], [], [], timeout)
+    if rlist:
+        line = sys.stdin.readline()
+        return line.rstrip("\n")
+    print(f"\n{timeout:.0f}秒間入力がなかったため、自動的に '{default}' として続行します。")
+    return default
+
+
 def with_retry(func):
     """LLM呼び出し関数をラップし、一時的なエラー時は指数バックオフで自動リトライする。
     サーバーがリトライ推奨秒数を明示している場合は、指数バックオフの値と比較して
@@ -178,11 +248,10 @@ def with_retry(func):
                 # （安全マージンとして1秒加算する）。
                 wait_seconds = backoff if suggested_delay is None else max(backoff, suggested_delay + 1.0)
                 print(
-                    f"一時的なエラーが発生しました（試行 {attempt}/{MAX_RETRIES}）: {e}\n"
-                    f"{wait_seconds:.0f}秒待って再試行します...",
+                    f"一時的なエラーが発生しました（試行 {attempt}/{MAX_RETRIES}）: {e}",
                     file=sys.stderr,
                 )
-                time.sleep(wait_seconds)
+                _countdown_sleep(wait_seconds)
                 backoff *= BACKOFF_MULTIPLIER
         raise last_exc  # pragma: no cover
 
@@ -484,8 +553,21 @@ if __name__ == "__main__":
             break
         except Exception as e:
             print(f"エラーが発生しました: {e}", file=sys.stderr)
+            if _is_daily_quota_exhausted(e):
+                print(
+                    "1日あたりのAPI利用上限（無料枠）に達しています。これは時間をおいても"
+                    "数十秒程度では解消しないため、自動リトライは行いません。\n"
+                    "・しばらく時間をおいて再実行する（クォータは太平洋時間の深夜0時にリセットされます）\n"
+                    "・--provider openai など別プロバイダに切り替える\n"
+                    "・Google AI Studio 側で課金設定（Tier 1）にして上限を引き上げる\n"
+                    "のいずれかをご検討ください。",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
             try:
-                answer = input("同じ内容でもう一度実行しますか？ (Y/N): ").strip().lower()
+                answer = _input_with_timeout(
+                    "同じ内容でもう一度実行しますか？ (Y/N): ", 30, "y"
+                ).strip().lower()
             except EOFError:
                 # 入力を受け付けられない環境（パイプ入力・CI等）では従来通り即時終了する。
                 sys.exit(1)
