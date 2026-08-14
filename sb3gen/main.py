@@ -40,8 +40,22 @@ def generate_sb3(
     if materializer is None:
         mat = AssetMaterializer(registry=registry)
         materializer = mat
-    elif registry is None and isinstance(materializer, AssetMaterializer):
-        registry = materializer.registry
+    elif isinstance(materializer, AssetMaterializer):
+        if registry is None:
+            registry = materializer.registry
+    elif registry is None:
+        # materializerがAssetMaterializerのインスタンスでない場合、そのmaterializerが
+        # 実際にアセットを登録しているレジストリをここから読み取ることはできない。
+        # このままDEFAULT_REGISTRYへ黙ってフォールバックすると、compile_project/write_sb3が
+        # materializerの登録先とは別のレジストリを参照することになり、writer側の
+        # 「アセット欠落時プレースホルダー自動フォールバック」が全コスチューム/サウンドに対して
+        # 静かに発動してしまう（見た目上は成功するが、中身が全部プレースホルダーになる）。
+        # 原因が分かりにくい形で壊れるより、ここで早期に明示的なエラーにする。
+        raise ValueError(
+            "materializerにAssetMaterializer以外のcallableを渡す場合、"
+            "そのmaterializerが実際に使用しているregistryをregistry引数として"
+            "明示的に渡してください（省略するとアセットが正しく解決できません）。"
+        )
 
     registry = registry or DEFAULT_REGISTRY
 

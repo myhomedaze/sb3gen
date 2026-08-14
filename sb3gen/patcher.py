@@ -46,6 +46,15 @@ CLARIFICATION_FALLBACK_MESSAGE = (
 )
 
 
+_PROCEDURE_BODY_SYSTEM_PROMPT = (
+    "対象のカスタムブロック（マイブロック）の本体を1個分、ScriptSpec（blocksのリスト）形式の"
+    "JSONのみで出力してください。他のカスタムブロックやスクリプトの内容はここに含めないでください。"
+    "本体内でこのカスタムブロックの引数の値を参照する場合は、"
+    "argument_reporter_string_number または argument_reporter_boolean ブロックを使い、"
+    "fields.VALUE にその引数名をそのまま指定してください。"
+)
+
+
 class ScriptPlanItem(BaseModel):
     """スプライト生成の第1段階で出力される、スクリプト一本分の軸となる要約。
 
@@ -103,21 +112,23 @@ def _generate_sprite_chunked(
     script_system_prompt: str,
     llm_call: LLMCallable,
     existing_scripts_context: str = "",
+    procedure_system_prompt: str = _PROCEDURE_BODY_SYSTEM_PROMPT,
 ) -> SpriteSpec:
-    """スプライトを「入れ物（shell）＋スクリプト計画」→「スクリプトを1本ずつ生成」
-    の2段階で生成する（7番: LLM出力安定性）。
+    """スプライトを「入れ物（shell）＋スクリプト計画＋カスタムブロック計画」→
+    「スクリプト／カスタムブロック本体を1本ずつ生成」の2段階で生成する（7番: LLM出力安定性）。
 
     以前の実装は SpriteSpec 全体（全スクリプトのブロック木を含む）を、1回のLLM呼び出しで
     一気に出力させていたため、スクリプトが多い・複雑なスプライトでは出力が途中で切れやすかった。
     今後カスタムブロックや拡張機能でスクリプト一本あたりのサイズがさらに増えても、
-    この分割方式なら、1回の呼び出しあたりの出力サイズはスクリプト単位に抑えられる。
+    この分割方式なら、1回の呼び出しあたりの出力サイズはスクリプト・カスタムブロック単位に抑えられる。
+
+    plan.procedure_plan（カスタムブロックのシグネチャ＋要約）は、以前はここで無視されており、
+    SpriteGenerationPlanで計画されたカスタムブロックが実際には一切生成されない不具合が
+    あったため、scriptsと同様に1個ずつ本体を個別生成してSpriteSpec.proceduresへ反映する。
     """
     plan = generate_json_with_retry(
         shell_system_prompt, shell_user_prompt, SpriteGenerationPlan, llm_call
     )
-
-    if not plan.script_plan:
-        return plan.shell.to_sprite_spec(scripts=[])
 
     def _script_system_prompt(idx: int, total: int) -> str:
         return (
@@ -137,15 +148,67 @@ def _generate_sprite_chunked(
         prompt += f"このスクリプトで実装すべき内容: {plan_item.summary}\n"
         return prompt
 
-    scripts = generate_items_individually(
-        plan.script_plan,
-        _script_system_prompt,
-        _script_user_prompt,
-        ScriptSpec,
-        llm_call,
+    scripts = (
+        generate_items_individually(
+            plan.script_plan,
+            _script_system_prompt,
+            _script_user_prompt,
+            ScriptSpec,
+            llm_call,
+        )
+        if plan.script_plan
+        else []
     )
 
-    return plan.shell.to_sprite_spec(scripts=scripts)
+    def _procedure_system_prompt(idx: int, total: int) -> str:
+        return (
+            f"{procedure_system_prompt}\n\n"
+            f"これは全{total}個中 {idx + 1}個目のカスタムブロック（マイブロック）です。"
+            "この本体1個分のScriptSpec（blocksのリスト）のみを出力し、他のカスタムブロックや"
+            "スクリプトの内容は含めないでください。"
+        )
+
+    def _procedure_user_prompt(idx: int, plan_item: ProcedurePlanItem) -> str:
+        other_summaries = [p.summary for i, p in enumerate(plan.procedure_plan) if i != idx]
+        prompt = (
+            f"スプライト: {plan.shell.name}\n"
+            f"このカスタムブロックの名前: {plan_item.name}\n"
+            "引数（本体内では argument_reporter_string_number / argument_reporter_boolean の"
+            f"fields.VALUEにこの名前を指定して参照する）: {[(a.name, a.type) for a in plan_item.arguments]}\n"
+            f"warp（画面更新をスキップして高速実行するか）: {plan_item.warp}\n"
+            f"このスプライトの他のカスタムブロックの要約: {other_summaries}\n"
+        )
+        if existing_scripts_context:
+            prompt += f"参考（既存のスクリプト・カスタムブロック文脈）:\n{existing_scripts_context}\n"
+        prompt += f"このカスタムブロックの本体で実装すべき内容: {plan_item.summary}\n"
+        return prompt
+
+    procedure_bodies = (
+        generate_items_individually(
+            plan.procedure_plan,
+            _procedure_system_prompt,
+            _procedure_user_prompt,
+            ScriptSpec,
+            llm_call,
+        )
+        if plan.procedure_plan
+        else []
+    )
+
+    procedures = [
+        ProcedureDefinitionSpec(
+            name=plan_item.name,
+            arguments=[
+                ProcedureArgumentSpec(name=a.name, type=a.type, default=a.default)
+                for a in plan_item.arguments
+            ],
+            warp=plan_item.warp,
+            body=body.blocks,
+        )
+        for plan_item, body in zip(plan.procedure_plan, procedure_bodies)
+    ]
+
+    return plan.shell.to_sprite_spec(scripts=scripts, procedures=procedures)
 
 
 class ActionType(str, Enum):
@@ -286,6 +349,9 @@ _MODIFY_SPRITE_SHELL_SYSTEM_PROMPT = (
     "shell.variablesにローカル変数として定義してください（他のスプライトからは見えません）。"
     "他のスプライトやステージと共有すべき値はここにvariablesとして含めず、"
     "グローバル変数として別途指示（modify_globals）に任せてください。"
+    "このスプライトが定義すべきカスタムブロック（マイブロック）がある場合は、"
+    "procedure_planフィールドに、それぞれの名前・引数（arguments）・warp・本体の簡潔な要約(summary)"
+    "のみを出力してください（本体のブロック木はこの段階では出力しないでください）。"
 )
 
 _MODIFY_SPRITE_SCRIPT_SYSTEM_PROMPT = (
@@ -376,6 +442,9 @@ _ADD_SPRITE_SHELL_SYSTEM_PROMPT = (
     "このスプライト固有の状態（例: HP、スコア、タイマーなど）は shell.variables に"
     "ローカル変数として定義してください（他のスプライトからは見えません）。"
     "他と共有すべき値はここに含めず、別のglobals指示に任せてください。"
+    "このスプライトが定義すべきカスタムブロック（マイブロック）がある場合は、"
+    "procedure_planフィールドに、それぞれの名前・引数（arguments）・warp・本体の簡潔な要約(summary)"
+    "のみを出力してください（本体のブロック木はこの段階では出力しないでください）。"
 )
 
 _ADD_SPRITE_SCRIPT_SYSTEM_PROMPT = (

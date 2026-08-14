@@ -12,7 +12,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 from sb3gen.main import generate_sb3
 
@@ -36,10 +36,21 @@ _RETRYABLE_MARKERS = (
     "timed out",
 )
 
+# 日次クォータ枯渇など、待っても解消しない種類のエラーを示すキーワード。
+# 429/RESOURCE_EXHAUSTED であっても、これらが含まれる場合はリトライしても無駄なので
+# 即座に失敗させる（例: Gemini無料枠の1日あたりのリクエスト上限超過）。
+_NON_RETRYABLE_QUOTA_MARKERS = (
+    "perday",
+    "per-day",
+    "per day",
+)
+
 
 def _is_retryable_error(exc: Exception) -> bool:
-    message = str(exc)
-    return any(marker.lower() in message.lower() for marker in _RETRYABLE_MARKERS)
+    message = str(exc).lower()
+    if any(marker in message for marker in _NON_RETRYABLE_QUOTA_MARKERS):
+        return False
+    return any(marker.lower() in message for marker in _RETRYABLE_MARKERS)
 
 
 def with_retry(func):
@@ -190,8 +201,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         default=None,
-        help="出力先の .sb3 ファイルパス（未指定の場合は実行のたびにタイムスタンプ付きの"
-        "ファイル名を自動生成し、既存ファイルを上書きしません）",
+        help="出力先の .sb3 ファイルパス（未指定の場合、--inputも未指定なら実行のたびに"
+        "タイムスタンプ付きのファイル名を自動生成し、既存ファイルを上書きしません。"
+        "--inputのみ指定した場合はそのファイルへ上書き保存します）",
+    )
+    parser.add_argument(
+        "--input",
+        default=None,
+        help="継続編集したい既存の .sb3 ファイルパス。指定すると、このファイルを読み込んでから"
+        "指示を適用します（未指定の場合は空の新規プロジェクトから生成します）。",
+    )
+    parser.add_argument(
+        "--reference",
+        action="append",
+        default=None,
+        metavar="PATH",
+        help="生成/編集の際にLLMに参考情報として渡すファイル。何度でも指定可能"
+        "（例: --reference notes.txt --reference other.sb3）。--inputとは異なり、"
+        "こちらは編集対象にはならず、あくまで参考文脈としてLLMに渡されます。"
+        ".sb3ファイルなら擬似コード化して、テキストファイル（.txt/.md/.json等）ならそのままの内容を含めます。",
     )
     return parser.parse_args()
 
@@ -208,18 +236,124 @@ def generate_output_path(directory: Union[str, Path] = ".") -> Path:
     return candidate
 
 
+# ---------------------------------------------------------------------------
+# 参考ファイル（--reference）の読み込み
+# ---------------------------------------------------------------------------
+# LLMへ渡す文脈が肥大化しすぎないよう、参考ファイル1件あたりの読み込み文字数の上限。
+_REFERENCE_MAX_CHARS = 20000
+
+# テキストとしてそのまま読み込んで問題ない拡張子（このリスト以外は原則バイナリ扱いとし、
+# 内容は読み込まずファイル名のみを伝える）。
+_TEXT_LIKE_SUFFIXES = {
+    ".txt", ".md", ".markdown", ".json", ".csv", ".tsv", ".yaml", ".yml",
+    ".py", ".js", ".html", ".htm", ".xml", ".log",
+}
+
+
+def _render_sb3_reference(path: Path) -> str:
+    """.sb3 ファイルを読み込み、各ターゲットを擬似コードへレンダリングして返す。"""
+    from sb3gen.reader import read_sb3
+    from sb3gen.renderer import render_sprite_pseudocode
+
+    project = read_sb3(path)
+    parts = [render_sprite_pseudocode(t) for t in project.targets]
+    text = "\n\n".join(parts)
+    if len(text) > _REFERENCE_MAX_CHARS:
+        text = text[:_REFERENCE_MAX_CHARS] + "\n...(以降省略)"
+    return text
+
+
+def _render_text_reference(path: Path) -> str:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if len(text) > _REFERENCE_MAX_CHARS:
+        text = text[:_REFERENCE_MAX_CHARS] + "\n...(以降省略)"
+    return text
+
+
+def build_reference_context(paths: Optional[List[str]]) -> str:
+    """--reference で指定された各ファイルを読み込み、LLMのuser_promptに前置する
+    参考情報ブロックへまとめる。読み込みに失敗したファイルは警告を出して読み飛ばす
+    （参考情報の欠落程度で処理全体を止める必要はないため）。
+    """
+    if not paths:
+        return ""
+
+    blocks: List[str] = []
+    for raw_path in paths:
+        path = Path(raw_path)
+        if not path.exists():
+            print(f"警告: 参考ファイルが見つかりません（無視します）: {path}", file=sys.stderr)
+            continue
+
+        try:
+            if path.suffix.lower() == ".sb3":
+                content = _render_sb3_reference(path)
+                label = f"{path.name}（Scratchプロジェクトの擬似コード）"
+            elif path.suffix.lower() in _TEXT_LIKE_SUFFIXES:
+                content = _render_text_reference(path)
+                label = path.name
+            else:
+                print(
+                    f"警告: 参考ファイル '{path}' はテキストとして解釈できない拡張子のため、"
+                    "ファイル名のみを参考情報として伝えます。",
+                    file=sys.stderr,
+                )
+                blocks.append(f"=== 参考: {path.name}（内容は読み込まれていません） ===")
+                continue
+        except Exception as e:
+            print(f"警告: 参考ファイル '{path}' の読み込みに失敗しました（無視します）: {e}", file=sys.stderr)
+            continue
+
+        blocks.append(f"=== 参考: {label} ===\n{content}")
+
+    if not blocks:
+        return ""
+
+    return "【参考情報（この内容自体は編集対象ではありません）】\n" + "\n\n".join(blocks)
+
+
 if __name__ == "__main__":
     args = parse_args()
 
     provider = resolve_provider(args.provider)
     llm_call = with_retry(PROVIDER_BUILDERS[provider]())
 
-    output_path = Path(args.output) if args.output else generate_output_path()
+    project = None
+    if args.input:
+        from sb3gen.reader import read_sb3
+
+        input_path = Path(args.input)
+        if not input_path.exists():
+            print(f"エラー: 指定された入力ファイルが見つかりません: {input_path}", file=sys.stderr)
+            sys.exit(1)
+        print(f"既存プロジェクトを読み込んでいます: {input_path}")
+        try:
+            project = read_sb3(input_path)
+        except Exception as e:
+            print(f"エラー: 既存プロジェクトの読み込みに失敗しました: {e}", file=sys.stderr)
+            print(
+                "（このツール自身が生成した .sb3 以外（Scratchエディターで直接保存したもの等）は未対応です）",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    if args.output:
+        output_path = Path(args.output)
+    elif args.input:
+        # 継続編集時はデフォルトで入力ファイルへそのまま上書き保存する（新規生成と違い、
+        # 何度指示してもファイルが増え続けないことを期待されると想定されるため）。
+        output_path = Path(args.input)
+    else:
+        output_path = generate_output_path()
 
     user_instruction = (
         args.instruction
         or "画面中央に赤い丸の新しいスプライトを追加して、旗が押されたら10歩動かすプログラムを作って"
     )
+
+    reference_context = build_reference_context(args.reference)
+    if reference_context:
+        user_instruction = f"{reference_context}\n\n---\n\n{user_instruction}"
 
     print(f"使用プロバイダ: {provider}")
     print(f"指示を実行中: {user_instruction}")
@@ -228,6 +362,7 @@ if __name__ == "__main__":
             instruction=user_instruction,
             llm_call=llm_call,
             output_path=output_path,
+            project=project,
         )
         print(f"生成が完了しました: {output_path}")
     except Exception as e:

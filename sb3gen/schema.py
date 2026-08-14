@@ -112,7 +112,9 @@ class SoundSpec(BaseModel):
     sample_count: Optional[int] = None
 
 
-OpcodeLiteral = Literal[*tuple(sorted(ALLOWED_OPCODES))]
+# ※ Literal[*tuple(...)] のようなアンパッキ構文はPython 3.11以降でしか使えない。
+# tupleをそのまま渡すと Literal[a, b, c] と同等になり、3.8以上で動く。
+OpcodeLiteral = Literal[tuple(sorted(ALLOWED_OPCODES))]
 
 
 class BlockSpec(BaseModel):

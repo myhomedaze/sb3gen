@@ -27,7 +27,7 @@ BLOCK_DEFS: Dict[str, Dict[str, Any]] = {
     "motion_turnleft": {"inputs": ["DEGREES"], "substacks": []},
     "motion_goto": {"inputs": ["TO"], "substacks": []},
     "motion_gotoxy": {"inputs": ["X", "Y"], "substacks": []},
-    "motion_glideto": {"fields": ["SECS"], "inputs": ["SECS", "TO"], "substacks": []},
+    "motion_glideto": {"inputs": ["SECS", "TO"], "substacks": []},
     "motion_glidesecstoxy": {"inputs": ["SECS", "X", "Y"], "substacks": []},
     "motion_pointindirection": {"inputs": ["DIRECTION"], "substacks": []},
     "motion_pointtowards": {"inputs": ["TOWARDS"], "substacks": []},
@@ -144,8 +144,27 @@ BLOCK_DEFS: Dict[str, Dict[str, Any]] = {
     "data_itemnumoflist": {"fields": ["LIST"], "inputs": ["ITEM"], "substacks": []},
     "data_lengthoflist": {"fields": ["LIST"], "inputs": [], "substacks": []},
     "data_listcontainsitem": {"fields": ["LIST"], "inputs": ["ITEM"], "substacks": []},
-    "data_showlist": {"fields": ["LIST"], "inputs": ["VALUE"], "substacks": []},
+    "data_showlist": {"fields": ["LIST"], "inputs": [], "substacks": []},
     "data_hidelist": {"fields": ["LIST"], "inputs": [], "substacks": []},
+}
+
+# 本来Scratchでドロップダウン入力（メニュー）であるべきinputの、opcodeごとの
+# (専用メニューブロックのopcode, そのフィールド名) 対応表。
+# これに列挙されていないinputは従来通り汎用の "text" シャドウにフォールバックする。
+# VM実行上はどちらでも動くが、ここで本来のopcodeを使うことで、Scratchエディタで
+# 開いた際の見た目・編集体験（ドロップダウン表示）が崩れないようにする。
+MENU_INPUT_DEFS: Dict[str, Dict[str, Tuple[str, str]]] = {
+    "sensing_touchingobject": {"TOUCHINGOBJECTMENU": ("sensing_touchingobjectmenu", "TOUCHINGOBJECTMENU")},
+    "sensing_distanceto": {"DISTANCETOMENU": ("sensing_distancetomenu", "DISTANCETOMENU")},
+    "sensing_of": {"OBJECT": ("sensing_of_object_menu", "OBJECT")},
+    "sound_play": {"SOUND_MENU": ("sound_sounds_menu", "SOUND_MENU")},
+    "sound_playuntildone": {"SOUND_MENU": ("sound_sounds_menu", "SOUND_MENU")},
+    "control_create_clone_of": {"CLONE_OPTION": ("control_create_clone_of_menu", "CLONE_OPTION")},
+    "looks_switchcostumeto": {"COSTUME": ("looks_costume", "COSTUME")},
+    "looks_switchbackdropto": {"BACKDROP": ("looks_backdrops", "BACKDROP")},
+    "motion_pointtowards": {"TOWARDS": ("motion_pointtowards_menu", "TOWARDS")},
+    "motion_goto": {"TO": ("motion_goto_menu", "TO")},
+    "motion_glideto": {"TO": ("motion_glideto_menu", "TO")},
 }
 
 
@@ -226,10 +245,17 @@ def _build_mutation(proc: ProcedureDefinitionSpec) -> Dict[str, Any]:
     arg_ids = [a.name for a in proc.arguments]
     arg_defaults: List[str] = []
     for a in proc.arguments:
-        if a.default is not None:
+        if a.type == "boolean":
+            # ScratchのVMはargumentdefaultsの文字列をJS的な真偽判定で扱うため、
+            # 空でない文字列は全てtruthyになる。str(False) は "False"（大文字・非空）
+            # になってしまい、意図した既定値falseがtrue扱いされてしまうバグがあったため、
+            # 必ず小文字の "true"/"false" に正規化する。
+            default_bool = bool(a.default) if a.default is not None else False
+            arg_defaults.append("true" if default_bool else "false")
+        elif a.default is not None:
             arg_defaults.append(str(a.default))
         else:
-            arg_defaults.append("false" if a.type == "boolean" else "")
+            arg_defaults.append("")
     return {
         "tagName": "mutation",
         "children": [],
@@ -250,6 +276,28 @@ def _compile_node(
 ) -> str:
     if block.opcode not in ALLOWED_OPCODES:
         raise ValueError(f"許可されていないopcodeです: {block.opcode}")
+
+    # BLOCK_DEFSに定義された必須inputs/fieldsが揃っているか検証する。
+    # ここを通さないと、LLMが必須inputを一つ落として出力してもコンパイルはエラーにならず
+    # 「動かないブロック」がそのままsb3に出力されてしまうため、procedures_callの
+    # 未定義チェックと同様に、ここで明示的に失敗させる。
+    block_def = BLOCK_DEFS.get(block.opcode)
+    if block_def is not None:
+        missing_inputs = [
+            name for name in block_def.get("inputs", []) if name not in block.inputs
+        ]
+        missing_fields = [
+            name for name in block_def.get("fields", []) if name not in block.fields
+        ]
+        if missing_inputs or missing_fields:
+            details = []
+            if missing_inputs:
+                details.append(f"不足inputs={missing_inputs}")
+            if missing_fields:
+                details.append(f"不足fields={missing_fields}")
+            raise ValueError(
+                f"ブロック '{block.opcode}' の定義が不完全です（{'; '.join(details)}）"
+            )
 
     block_id = generate_id()
 
@@ -311,7 +359,23 @@ def _compile_node(
             else:
                 compiled_fields["VALUE"] = [str(v), None]
 
-    # inputsのコンパイル（ネストしたBlockSpecや辞書、プリミティブ値の処理）
+    # 上記で特別扱いした以外のfields（STOP_OPTION、KEY_OPTION、EFFECT、STYLE、
+    # FRONT_BACK、NUMBER_NAME、DRAG_MODE、PROPERTY、CURRENTMENU、OPERATOR、WHATEVER等）は
+    # この時点でまだ素の値（例: "all"）のまま。しかし実際のScratchのsb3形式では、
+    # すべてのfieldsは例外なく [値, idまたはnull] の2要素配列である必要があり、
+    # 素の文字列のままなとScratchのデシリアライザが fieldJSON[0] を文字列の
+    # インデックスとして解釈してしまい（例: "all"[0] == "a"）、値が壊れる重大なバグがあった。
+    # ここで残り全てのfieldsを [値, null] 形式へ一律に正規化する（既に上記で
+    # [値, id] 化済みのものは影響を受けない）。
+    for _fkey, _fval in list(compiled_fields.items()):
+        if isinstance(_fval, list):
+            if len(_fval) == 0:
+                compiled_fields[_fkey] = [None, None]
+            elif len(_fval) == 1:
+                compiled_fields[_fkey] = [_fval[0], None]
+            # 2要素以上はすでに [値, id] 形式なのでそのまま
+        else:
+            compiled_fields[_fkey] = [_fval, None]
     compiled_inputs: Dict[str, Any] = {}
     for input_name, val in block.inputs.items():
         sub_block_spec = None
@@ -330,17 +394,41 @@ def _compile_node(
             compiled_inputs[input_name] = [1, sub_id]
         else:
             shadow_id = generate_id()
-            val_str = str(val[0] if isinstance(val, list) and len(val) > 0 else val)
+            raw_val = val[0] if isinstance(val, list) and len(val) > 0 else val
+            if isinstance(raw_val, bool):
+                # str(False) は "False"（大文字・非空文字列）になり、Scratch VM側の
+                # JS的な真偽判定では非空文字列は全てtruthyになるため、意図したfalseが
+                # true扱いされてしまう。_build_mutationの既定値と同様に小文字へ正規化する。
+                val_str = "true" if raw_val else "false"
+            else:
+                val_str = str(raw_val)
             compiled_inputs[input_name] = [1, shadow_id]
-            blocks_out[shadow_id] = {
-                "opcode": "text",
-                "next": None,
-                "parent": block_id,
-                "inputs": {},
-                "fields": {"TEXT": [val_str, None]},
-                "shadow": True,
-                "topLevel": False
-            }
+
+            menu_def = MENU_INPUT_DEFS.get(block.opcode, {}).get(input_name)
+            if menu_def is not None:
+                # 本来ドロップダウン（メニュー）であるべきinputは、専用メニューopcodeの
+                # シャドウブロックとして出力する（fieldsに値を持たせる。TEXTのinputは持たない）。
+                # これによりScratchエディタで開いた際もドロップダウンとして正しく表示される。
+                menu_opcode, field_name = menu_def
+                blocks_out[shadow_id] = {
+                    "opcode": menu_opcode,
+                    "next": None,
+                    "parent": block_id,
+                    "inputs": {},
+                    "fields": {field_name: [val_str, None]},
+                    "shadow": True,
+                    "topLevel": False
+                }
+            else:
+                blocks_out[shadow_id] = {
+                    "opcode": "text",
+                    "next": None,
+                    "parent": block_id,
+                    "inputs": {},
+                    "fields": {"TEXT": [val_str, None]},
+                    "shadow": True,
+                    "topLevel": False
+                }
 
     # substacksの処理
     for i, substack in enumerate(block.substacks):
