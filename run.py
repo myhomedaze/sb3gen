@@ -61,6 +61,16 @@ _RETRYABLE_MARKERS = (
     "timed out",
 )
 
+# 上記のうち「呼び出しペースが速すぎて弾かれた」ことを示すキーワード（プロバイダ横断）。
+# 503/timeout等の一時的な障害と違い、これらはこちら側の呼び出し間隔を空ければ
+# 回避できる性質のエラーなので、_PacedCaller の自動ペース調整の対象にする。
+_RATE_LIMIT_MARKERS = (
+    "429",
+    "RESOURCE_EXHAUSTED",
+    "rate limit",
+    "too many requests",
+)
+
 # 日次クォータ枯渇など、待っても解消しない種類のエラーを示すキーワード。
 # 429/RESOURCE_EXHAUSTED であっても、これらが含まれる場合はリトライしても無駄なので
 # 即座に失敗させる（例: Gemini無料枠の1日あたりのリクエスト上限超過）。
@@ -78,23 +88,92 @@ def _is_retryable_error(exc: Exception) -> bool:
     return any(marker.lower() in message for marker in _RETRYABLE_MARKERS)
 
 
+def _is_rate_limit_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(marker.lower() in message for marker in _RATE_LIMIT_MARKERS)
+
+
+# ---------------------------------------------------------------------------
+# 呼び出しペースの自動調整（プロバイダ横断・特定モデルの数値をハードコードしない）
+# ---------------------------------------------------------------------------
+# 「1分あたり何回まで」のような具体的な数値はプロバイダ・モデルごとに異なり、
+# しかも変動する（実際、同じ実行中でも Gemini のモデルを切り替えて全く違う値に
+# なった）。特定の数値を決め打ちするのではなく、実際にレート制限エラーへ
+# 当たった経験から呼び出し間隔を学習し、次第に最適な間隔へ収束させる。
+_PACE_GROWTH_FACTOR = 1.6  # レート制限に当たった際、間隔をこの倍率で広げる
+_PACE_RELAX_FACTOR = 0.85  # 連続成功時、間隔をこの倍率で少しずつ緩める
+_PACE_RELAX_AFTER_SUCCESSES = 8  # これだけ連続成功したら間隔を緩めてみる
+_PACE_MIN_FLOOR_SECONDS = 1.0  # 一度レート制限に当たった後の間隔の下限
+
+
+class _PacedCaller:
+    """LLM呼び出しの間隔を、実際に起きたレート制限エラーから学習して自動調整する。
+
+    特定プロバイダ・特定モデルのRPM値を知らなくても、「訰まったら間隔を広げる、
+    しばらく問題なければ少し狭めてみる」というフィードバックループだけで、
+    そのセッション内で使っているAPIキーの実際の許容ペースに自動で近づいていく。
+    """
+
+    def __init__(self) -> None:
+        self._min_interval = 0.0
+        self._last_call_at: Optional[float] = None
+        self._consecutive_successes = 0
+
+    def wait_for_turn(self) -> None:
+        if self._min_interval <= 0 or self._last_call_at is None:
+            return
+        elapsed = time.monotonic() - self._last_call_at
+        remaining = self._min_interval - elapsed
+        if remaining > 0:
+            time.sleep(remaining)
+
+    def record_success(self) -> None:
+        self._last_call_at = time.monotonic()
+        self._consecutive_successes += 1
+        if self._min_interval > 0 and self._consecutive_successes >= _PACE_RELAX_AFTER_SUCCESSES:
+            self._min_interval = max(0.0, self._min_interval * _PACE_RELAX_FACTOR)
+            if self._min_interval < 0.05:
+                self._min_interval = 0.0
+            self._consecutive_successes = 0
+
+    def record_rate_limit_hit(self, suggested_delay: Optional[float]) -> None:
+        self._last_call_at = time.monotonic()
+        self._consecutive_successes = 0
+        widened = max(self._min_interval * _PACE_GROWTH_FACTOR, _PACE_MIN_FLOOR_SECONDS)
+        if suggested_delay is not None:
+            widened = max(widened, suggested_delay)
+        self._min_interval = widened
+
+
 def with_retry(func):
     """LLM呼び出し関数をラップし、一時的なエラー時は指数バックオフで自動リトライする。
     サーバーがリトライ推奨秒数を明示している場合は、指数バックオフの値と比較して
     長い方（安全な方）を実際の待機秒数として採用する。
+    さらに、レート制限エラーに当たった実績をもとに、以降の呼び出し間隔を自動的に
+    調整する（_PacedCaller）ことで、同じセッション中に何度も同じ制限へ
+    ぶつかり直すのを防ぐ。この間隔調整はプロバイダやモデルの種類に関わらず、
+    実際に発生したエラーから学習するため、モデルを切り替えても自動的に対応する。
     """
+    pacer = _PacedCaller()
 
     def wrapped(system_prompt: str, user_prompt: str) -> str:
         backoff = INITIAL_BACKOFF_SECONDS
         last_exc: Optional[Exception] = None
         for attempt in range(1, MAX_RETRIES + 1):
+            pacer.wait_for_turn()
             try:
-                return func(system_prompt, user_prompt)
+                result = func(system_prompt, user_prompt)
+                pacer.record_success()
+                return result
             except Exception as e:
                 last_exc = e
+                suggested_delay = _extract_suggested_retry_delay(str(e))
+                if _is_rate_limit_error(e):
+                    pacer.record_rate_limit_hit(suggested_delay)
+                else:
+                    pacer.record_success()  # 呼び出し時刻だけ更新（ペースは広げない）
                 if not _is_retryable_error(e) or attempt == MAX_RETRIES:
                     raise
-                suggested_delay = _extract_suggested_retry_delay(str(e))
                 # サーバー指定の待機秒数がバックオフより長い場合はそちらを採用する
                 # （安全マージンとして1秒加算する）。
                 wait_seconds = backoff if suggested_delay is None else max(backoff, suggested_delay + 1.0)
