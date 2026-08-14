@@ -139,7 +139,20 @@ def _parse_block(
         if not isinstance(val, list) or len(val) < 2:
             continue
         ref = val[1]
-        if ref is None or ref not in blocks:
+        if ref is None:
+            continue
+        if isinstance(ref, list):
+            # コンパクトな「プリミティブ値の埋め込み表現」（例: [1, [4, "100"]]）。
+            # 通常は val[1] はblocks辞書内の他ブロックへのID参照（文字列）だが、
+            # Scratch本家エディタ等が出力する.sb3では、参照先IDの代わりに
+            # [TYPE, VALUE, ...] 形式のプリミティブ値そのものがインラインで埋め込まれることがある。
+            # これを考慮せず "ref not in blocks"（辞書のキーに対するハッシュ検索）を
+            # 行うと、refがリスト（ハッシュ不可）なため TypeError: unhashable type: 'list'
+            # でクラッシュしていた不具合があった。ここでは値部分（インデックス1）を
+            # 直接取り出してinputsの値とする。
+            inputs[key] = ref[1] if len(ref) > 1 else None
+            continue
+        if ref not in blocks:
             continue
         ref_block = blocks[ref]
 
@@ -210,7 +223,7 @@ def _parse_procedures(
         for idx, arg_id in enumerate(argument_ids):
             arg_type: ProcedureArgumentType = "string_number"
             ref = proto_inputs.get(arg_id)
-            if isinstance(ref, list) and len(ref) > 1 and ref[1] in blocks:
+            if isinstance(ref, list) and len(ref) > 1 and isinstance(ref[1], str) and ref[1] in blocks:
                 if blocks[ref[1]].get("opcode") == "argument_reporter_boolean":
                     arg_type = "boolean"
 

@@ -357,14 +357,28 @@ if __name__ == "__main__":
 
     print(f"使用プロバイダ: {provider}")
     print(f"指示を実行中: {user_instruction}")
-    try:
-        generate_sb3(
-            instruction=user_instruction,
-            llm_call=llm_call,
-            output_path=output_path,
-            project=project,
-        )
-        print(f"生成が完了しました: {output_path}")
-    except Exception as e:
-        print(f"エラーが発生しました: {e}", file=sys.stderr)
-        sys.exit(1)
+
+    # エラー発生時に、同じ指示で再実行するかをユーザーに確認する。
+    # LLMの出力は毎回変わるため、コンパイル時のフィールド欠落など一時的な失敗は
+    # 単純な再実行で直ることが多いため、毎回 CLI 引数を打ち直さずこの場で循環できるようにする。
+    while True:
+        try:
+            generate_sb3(
+                instruction=user_instruction,
+                llm_call=llm_call,
+                output_path=output_path,
+                project=project,
+            )
+            print(f"生成が完了しました: {output_path}")
+            break
+        except Exception as e:
+            print(f"エラーが発生しました: {e}", file=sys.stderr)
+            try:
+                answer = input("同じ内容でもう一度実行しますか？ (Y/N): ").strip().lower()
+            except EOFError:
+                # 入力を受け付けられない環境（パイプ入力・CI等）では従来通り即時終了する。
+                sys.exit(1)
+            if answer not in ("y", "yes"):
+                sys.exit(1)
+            print("再実行します...")
+            print(f"指示を実行中: {user_instruction}")

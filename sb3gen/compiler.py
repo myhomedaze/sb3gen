@@ -150,6 +150,14 @@ BLOCK_DEFS: Dict[str, Dict[str, Any]] = {
     "data_listcontainsitem": {"fields": ["LIST"], "inputs": ["ITEM"], "substacks": []},
     "data_showlist": {"fields": ["LIST"], "inputs": [], "substacks": []},
     "data_hidelist": {"fields": ["LIST"], "inputs": [], "substacks": []},
+
+    # カスタムブロック本体内で、そのカスタムブロックの引数を参照するためのレポーター。
+    # 以前はBLOCK_DEFSにこの2つの定義が無く、必須fields（VALUE＝参照する引数名）の
+    # 検証がここだけスキップされていた。LLMがVALUEを出力し忘れても検出されず、
+    # 値を持たない（=常に空扱いになる）引数リポーターがそのまま.sb3に出力されてしまう
+    # 不具合があったため、他のブロックと同様に必須fieldsとして明示する。
+    "argument_reporter_string_number": {"fields": ["VALUE"], "inputs": [], "substacks": []},
+    "argument_reporter_boolean": {"fields": ["VALUE"], "inputs": [], "substacks": []},
 }
 
 # 本来Scratchでドロップダウン入力（メニュー）であるべきinputの、opcodeごとの
