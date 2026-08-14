@@ -20,8 +20,7 @@ def render_sprite_pseudocode(sprite: SpriteSpec) -> str:
         body_lines.extend(_render_script(script, indent=2))
             
     joined = "\n".join(body_lines)
-    pad = ""
-    return f"{header}\n{joined}\n{pad}end"
+    return f"{header}\n{joined}\nend"
 
 
 def _render_script(script: ScriptSpec, indent: int) -> List[str]:

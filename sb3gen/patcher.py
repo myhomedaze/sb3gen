@@ -349,6 +349,9 @@ _MODIFY_SPRITE_SHELL_SYSTEM_PROMPT = (
     "shell.variablesにローカル変数として定義してください（他のスプライトからは見えません）。"
     "他のスプライトやステージと共有すべき値はここにvariablesとして含めず、"
     "グローバル変数として別途指示（modify_globals）に任せてください。"
+    "新しくグローバル変数/リスト/ブロードキャストが必要になった場合は、"
+    "下記に提示する既存の名前一覧と衝突しない名前を使ってください"
+    "（同じ意味のものを別名で作らないよう、既存の名前が使えるならそれを再利用してください）。"
     "このスプライトが定義すべきカスタムブロック（マイブロック）がある場合は、"
     "procedure_planフィールドに、それぞれの名前・引数（arguments）・warp・本体の簡潔な要約(summary)"
     "のみを出力してください（本体のブロック木はこの段階では出力しないでください）。"
@@ -368,7 +371,18 @@ def handle_modify_sprite(
         return PatchResult(status=PatchStatus.FAILED, message=f"スプライト '{sprite_name}' が見つかりません。")
 
     pseudocode = render_sprite_pseudocode(target_sprite)
-    shell_user_prompt = f"--- 対象スプライト ---\n{pseudocode}\n\n--- 修正指示 ---\n{instruction}\n"
+    # 6番（予防策）: 既存のグローバル変数/リスト/ブロードキャスト名を提示し、
+    # 同じ意味のものを別名で重複生成させない・衝突する新規名を作らせないようにする。
+    globals_context = (
+        f"既存のグローバル変数: {[v.name for v in project.variables]}\n"
+        f"既存のグローバルリスト: {[l.name for l in project.lists]}\n"
+        f"既存のブロードキャスト: {[b.name for b in project.broadcasts]}\n"
+    )
+    shell_user_prompt = (
+        f"--- 対象スプライト ---\n{pseudocode}\n\n"
+        f"--- プロジェクト全体の既存グローバル定義 ---\n{globals_context}\n"
+        f"--- 修正指示 ---\n{instruction}\n"
+    )
 
     # 7番（LLM出力安定性）: SpriteSpec全体を1回で出力させず、shell（入れ物）＋
     # スクリプト計画 → スクリプトを1本ずつ生成、の2段階に分割する。既存のスクリプト
@@ -442,6 +456,9 @@ _ADD_SPRITE_SHELL_SYSTEM_PROMPT = (
     "このスプライト固有の状態（例: HP、スコア、タイマーなど）は shell.variables に"
     "ローカル変数として定義してください（他のスプライトからは見えません）。"
     "他と共有すべき値はここに含めず、別のglobals指示に任せてください。"
+    "新しくグローバル変数/リスト/ブロードキャストが必要になった場合は、"
+    "下記に提示する既存の名前一覧と衝突しない名前を使ってください"
+    "（同じ意味のものを別名で作らないよう、既存の名前が使えるならそれを再利用してください）。"
     "このスプライトが定義すべきカスタムブロック（マイブロック）がある場合は、"
     "procedure_planフィールドに、それぞれの名前・引数（arguments）・warp・本体の簡潔な要約(summary)"
     "のみを出力してください（本体のブロック木はこの段階では出力しないでください）。"
@@ -463,7 +480,18 @@ def handle_add_sprite(
         decisions = _decide_assets(instruction, llm_call)
         costumes = [materialize_asset(d) for d in decisions]
 
-        shell_user_prompt = f"ユーザーの指示: {instruction}\n利用可能なコスチューム名: {[c.name for c in costumes]}\n"
+        # 6番（予防策）: 既存のグローバル変数/リスト/ブロードキャスト名を提示し、
+        # 新規スプライトのローカル変数やグローバル参照が既存の命名と衝突・重複しないようにする。
+        globals_context = (
+            f"既存のグローバル変数: {[v.name for v in project.variables]}\n"
+            f"既存のグローバルリスト: {[l.name for l in project.lists]}\n"
+            f"既存のブロードキャスト: {[b.name for b in project.broadcasts]}\n"
+        )
+        shell_user_prompt = (
+            f"ユーザーの指示: {instruction}\n"
+            f"利用可能なコスチューム名: {[c.name for c in costumes]}\n"
+            f"{globals_context}"
+        )
         # 7番（LLM出力安定性）: こちらも SpriteSpec 全体を一括出力させず、
         # shell（入れ物）＋スクリプト計画 → スクリプトを1本ずつ生成、の2段階に分割する。
         new_sprite = _generate_sprite_chunked(

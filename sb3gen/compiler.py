@@ -75,7 +75,11 @@ BLOCK_DEFS: Dict[str, Dict[str, Any]] = {
     "event_whenkeypressed": {"fields": ["KEY_OPTION"], "inputs": [], "substacks": []},
     "event_whenthisspriteclicked": {"inputs": [], "substacks": []},
     "event_whenbackdropswitchesto": {"fields": ["BACKDROP"], "inputs": [], "substacks": []},
-    "event_whengreaterthan": {"fields": ["WHATEVER"], "inputs": ["VALUE"], "substacks": []},
+    # 実際のScratch VM実装（scratch3_event.jsのhatGreaterThanPredicate）はargs.WHENGREATERTHANMENUを
+    # 参照する。以前は存在しないフィールド名 "WHATEVER" が使われており、ブロック自体は
+    # エラーにならず生成されるが、Scratch上ではタイマー/音量の判定が常にfalseになり
+    # 実質動作しないバグがあったため修正。
+    "event_whengreaterthan": {"fields": ["WHENGREATERTHANMENU"], "inputs": ["VALUE"], "substacks": []},
     "event_broadcast": {"inputs": ["BROADCAST_INPUT"], "substacks": []},
     "event_broadcastandwait": {"inputs": ["BROADCAST_INPUT"], "substacks": []},
     "event_whenbroadcastreceived": {"fields": ["BROADCAST_OPTION"], "inputs": [], "substacks": []},

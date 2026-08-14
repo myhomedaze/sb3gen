@@ -63,7 +63,7 @@ def _compute_md5(content: bytes) -> str:
 
 
 def _infer_svg_center(content: bytes) -> Tuple[float, float]:
-    """SVGのviewBoxまたはwidth/height属性から回転中心（幅・高さの半分）を推定する。
+    """SVGのviewBoxまたはwidth/height属性から回転中心を推定する。
     どちらも取得できない場合は (0.0, 0.0) を返す。"""
     try:
         text = content.decode("utf-8", errors="ignore")
@@ -71,13 +71,18 @@ def _infer_svg_center(content: bytes) -> Tuple[float, float]:
         return (0.0, 0.0)
 
     m = re.search(
-        r'viewBox\s*=\s*"\s*[-\d.]+[\s,]+[-\d.]+[\s,]+([\d.]+)[\s,]+([\d.]+)\s*"',
+        r'viewBox\s*=\s*"\s*([-\d.]+)[\s,]+([-\d.]+)[\s,]+([\d.]+)[\s,]+([\d.]+)\s*"',
         text,
     )
     if m:
         try:
-            width, height = float(m.group(1)), float(m.group(2))
-            return (width / 2, height / 2)
+            # viewBox="minX minY width height"。以前はminX/minYを無視しwidth/2, height/2を
+            # そのまま中心としていたため、minX/minYが0でないSVG（テンプレートや
+            # --reference経由で読み込む外部SVGなど）で回転中心がズレる不具合があった。
+            # min_x/min_yを加算して実際の中心座標を求める。
+            min_x, min_y = float(m.group(1)), float(m.group(2))
+            width, height = float(m.group(3)), float(m.group(4))
+            return (min_x + width / 2, min_y + height / 2)
         except ValueError:
             pass
 

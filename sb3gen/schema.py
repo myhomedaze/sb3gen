@@ -284,6 +284,19 @@ def validate_project_spec(data: Dict[str, Any]) -> ProjectSpec:
         # このターゲット自身が定義しているカスタムブロックの重複名チェック
         if len(proc_names) != len(target.procedures):
             raise ValueError(f"スプライト '{target.name}' でカスタムブロック名が重複しています。")
+        # proccode（name + 引数プレースホルダの連結）の重複チェック。
+        # 例えば name="foo %s"（引数0個）と name="foo"（string_number引数1個）は
+        # name自体は別物だが、どちらも proccode が "foo %s" になり衝突する。
+        # これを見逃すと、procedures_call の呼び出し先解決（reader.py側でのproccode->name
+        # 復元）が衝突時にどちらか一方へ上書きされ、.sb3を読み込んで継続編集する際に
+        # 誤ったカスタムブロックが呼ばれる不具合につながるため、nameの重複チェックと
+        # 同様にここで明示的に検出する。
+        proccodes = [p.proccode for p in target.procedures]
+        if len(set(proccodes)) != len(proccodes):
+            raise ValueError(
+                f"スプライト '{target.name}' でカスタムブロックのproccode（名前+引数シグネチャ）が"
+                "衝突しています。別のカスタムブロックと区別できる名前にしてください。"
+            )
         for proc in target.procedures:
             arg_names = [a.name for a in proc.arguments]
             if len(set(arg_names)) != len(arg_names):
