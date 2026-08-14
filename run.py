@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime
@@ -23,6 +24,30 @@ from sb3gen.main import generate_sb3
 MAX_RETRIES = 5
 INITIAL_BACKOFF_SECONDS = 2.0
 BACKOFF_MULTIPLIER = 2.0
+
+# サーバーが「あと何秒でリトライ可能か」を明示している場合に、そのヒントを抽出する正規表現。
+# 例: Geminiのエラーメッセージ中の "retryDelay': '36s'" や "Please retry in 36.07784804s"。
+# 以前はこれを一切見ておらず、指数バックオフ（2/4/8/16/32秒）がサーバー指定の待機時間
+# （例: 36秒）より短いまま MAX_RETRIES を使い切ってしまい、実際には少し待てば成功する
+# はずのリクエストがリトライ回数不足で失敗扱いになる不具合があったため、
+# サーバーのヒントが取得できた場合はそちらを優先して待つように修正する。
+_RETRY_DELAY_PATTERNS = (
+    re.compile(r"retrydelay['\"]?\s*[:=]\s*['\"]?(\d+(?:\.\d+)?)\s*s", re.IGNORECASE),
+    re.compile(r"retry in\s+(\d+(?:\.\d+)?)\s*s", re.IGNORECASE),
+)
+
+
+def _extract_suggested_retry_delay(message: str) -> Optional[float]:
+    """エラーメッセージからサーバー推奨のリトライ待機秒数を抽出する。見つからなければNone。"""
+    for pattern in _RETRY_DELAY_PATTERNS:
+        m = pattern.search(message)
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                continue
+    return None
+
 
 # リトライ対象とみなすエラーメッセージ中のキーワード（プロバイダ横断で緩めに判定）
 _RETRYABLE_MARKERS = (
@@ -54,7 +79,10 @@ def _is_retryable_error(exc: Exception) -> bool:
 
 
 def with_retry(func):
-    """LLM呼び出し関数をラップし、一時的なエラー時は指数バックオフで自動リトライする。"""
+    """LLM呼び出し関数をラップし、一時的なエラー時は指数バックオフで自動リトライする。
+    サーバーがリトライ推奨秒数を明示している場合は、指数バックオフの値と比較して
+    長い方（安全な方）を実際の待機秒数として採用する。
+    """
 
     def wrapped(system_prompt: str, user_prompt: str) -> str:
         backoff = INITIAL_BACKOFF_SECONDS
@@ -66,12 +94,16 @@ def with_retry(func):
                 last_exc = e
                 if not _is_retryable_error(e) or attempt == MAX_RETRIES:
                     raise
+                suggested_delay = _extract_suggested_retry_delay(str(e))
+                # サーバー指定の待機秒数がバックオフより長い場合はそちらを採用する
+                # （安全マージンとして1秒加算する）。
+                wait_seconds = backoff if suggested_delay is None else max(backoff, suggested_delay + 1.0)
                 print(
                     f"一時的なエラーが発生しました（試行 {attempt}/{MAX_RETRIES}）: {e}\n"
-                    f"{backoff:.0f}秒待って再試行します...",
+                    f"{wait_seconds:.0f}秒待って再試行します...",
                     file=sys.stderr,
                 )
-                time.sleep(backoff)
+                time.sleep(wait_seconds)
                 backoff *= BACKOFF_MULTIPLIER
         raise last_exc  # pragma: no cover
 
